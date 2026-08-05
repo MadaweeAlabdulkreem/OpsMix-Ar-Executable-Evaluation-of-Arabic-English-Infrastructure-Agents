@@ -21,6 +21,11 @@ def _initial_state() -> dict:
         "disk_total_gb": 10, # Total disk capacity
         "disk_used_gb": 8.2, # Current disk usage
         "cache_size_mb": 512,
+
+        # New state for the additional tools
+        "api_key": "initial-api-key",
+        "replicas": 1,
+        
         "services": {
             name: {"status": "running", "last_restart": None}
             for name in SERVICE_NAMES

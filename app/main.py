@@ -61,3 +61,38 @@ def restart_service(service: str):
         "service": service,
         "last_restart": now,
     }
+
+# The fourth tool: rotate_api_key()
+# Generate a new API key and replace the existing one.
+import secrets
+
+@app.post("/rotate_api_key")
+def rotate_api_key():
+    new_key = secrets.token_hex(32)
+
+    state["api_key"] = new_key
+    state["api_key_last_rotated"] = datetime.now(timezone.utc).isoformat()
+
+    return {
+        "status": "success",
+        "api_key": new_key,
+        "api_key_last_rotated": state["api_key_last_rotated"],
+    }
+
+
+# The fifth tool: scale_replicas(n)
+# Scale the number of running replicas.
+@app.post("/scale_replicas")
+def scale_replicas(n: int):
+    if n < 1:
+        raise HTTPException(
+            status_code=400,
+            detail="Replica count must be at least 1."
+        )
+
+    state["replicas"] = n
+
+    return {
+        "status": "success",
+        "replicas": state["replicas"],
+    }
