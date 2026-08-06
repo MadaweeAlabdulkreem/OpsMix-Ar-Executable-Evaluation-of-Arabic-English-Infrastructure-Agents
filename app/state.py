@@ -25,7 +25,25 @@ def _initial_state() -> dict:
             name: {"status": "running", "last_restart": None}
             for name in SERVICE_NAMES
         },
+"metrics": {
+    "nginx": {
+        "cpu_percent": 18,
+        "memory_mb": 220
+    },
+    "redis": {
+        "cpu_percent": 12,
+        "memory_mb": 340
+    },
+    "api": {
+        "cpu_percent": 35,
+        "memory_mb": 512
+    }
+},
 
+"deployment": {
+    "current_version": "v1.1.0",
+    "previous_version": "v1.0.9"
+},
         "history": [],  # List of all actions taken, in order
     }
 

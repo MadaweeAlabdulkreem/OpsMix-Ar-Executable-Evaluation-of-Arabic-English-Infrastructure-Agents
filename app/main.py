@@ -72,7 +72,37 @@ def restart_service(service: str):
         "service": service,
         "last_restart": now,
     }
+@app.get("/get_metrics")
+def get_metrics(service: str):
+    service = service.strip().lower()
 
+    if service not in SERVICE_NAMES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Service '{service}' is not supported."
+        )
+
+    _record("get_metrics", {"service": service})
+
+    return {
+        "service": service,
+        "metrics": state["metrics"][service]
+    }
+@app.post("/rollback_deploy")
+def rollback_deploy():
+
+    current = state["deployment"]["current_version"]
+    previous = state["deployment"]["previous_version"]
+
+    state["deployment"]["current_version"] = previous
+    state["deployment"]["previous_version"] = current
+
+    _record("rollback_deploy", {})
+
+    return {
+        "status": "success",
+        "rolled_back_to": previous
+    }
 @app.get("/history")
 def get_history():
     return state["history"]
