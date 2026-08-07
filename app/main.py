@@ -4,17 +4,21 @@ Each tool from the project spec becomes exactly one endpoint here.
 This step only adds check_disk() -- clear_cache() and
 restart_service() come in later steps.
 """
+
 from __future__ import annotations
+from datetime import datetime, timezone
+
 from fastapi import FastAPI, HTTPException
 from app.state import state, SERVICE_NAMES
-from datetime import datetime, timezone
 
 
 # resourse: https://fastapi.tiangolo.com/tutorial/body/
 app = FastAPI(title="Tiny Infra Service")
 
-def _record(tool: str, args: dict, timestamp: str | None = None) -> None:
-    
+# Called by every tool AFTER it succeeds
+
+def _record(tool: str, args: dict, timestamp: str | None = None):
+    """Save every successful tool call in the shared history."""
     state["history"].append({
         "tool": tool,
         "args": args,
@@ -40,7 +44,7 @@ def clear_cache():
  
     state["disk_used_gb"] = max(0, state["disk_used_gb"] - freed_gb)
     state["cache_size_mb"] = 0
-    _record("check_disk", {})
+    _record("clear_cache", {})
 
     disk_usage_percent = (state["disk_used_gb"] / state["disk_total_gb"]) * 100
  
@@ -65,14 +69,10 @@ def restart_service(service: str):
     now = datetime.now(timezone.utc).isoformat()
     state["services"][service]["status"] = "running"
     state["services"][service]["last_restart"] = now
-    _record("check_disk", {})
-
+    _record("restart_service", {"service": service}, timestamp=now)
     return {
         "status": "success",
         "service": service,
         "last_restart": now,
     }
 
-@app.get("/history")
-def get_history():
-    return state["history"]
