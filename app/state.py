@@ -23,11 +23,20 @@ def _initial_state() -> dict:
         "cache_size_mb": 512,
 
         # New state for the additional tools
+        # API key state
         "api_key": "initial-api-key",
+        "api_key_last_rotated": None,
+
+        # Scaling state
         "replicas": 1,
-        
+
+        # Service state
         "services": {
-            name: {"status": "running", "last_restart": None}
+            name: {
+                "status": "running",
+                "last_restart": None,
+                "restart_count": 0,
+            }
             for name in SERVICE_NAMES
         },
     }

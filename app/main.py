@@ -68,15 +68,19 @@ import secrets
 
 @app.post("/rotate_api_key")
 def rotate_api_key():
+
     new_key = secrets.token_hex(32)
 
-    state["api_key"] = new_key
-    state["api_key_last_rotated"] = datetime.now(timezone.utc).isoformat()
+    rotated_at = datetime.now(timezone.utc).isoformat()
 
+    state["api_key"] = new_key
+    state["api_key_last_rotated"] = rotated_at
+
+    # Do NOT return the actual API key
     return {
         "status": "success",
-        "api_key": new_key,
-        "api_key_last_rotated": state["api_key_last_rotated"],
+        "api_key_rotated": True,
+        "api_key_last_rotated": rotated_at,
     }
 
 
@@ -84,15 +88,32 @@ def rotate_api_key():
 # Scale the number of running replicas.
 @app.post("/scale_replicas")
 def scale_replicas(n: int):
-    if n < 1:
+
+    if n < MIN_REPLICAS or n > MAX_REPLICAS:
         raise HTTPException(
             status_code=400,
-            detail="Replica count must be at least 1."
+            detail=(
+                f"Replica count must be between "
+                f"{MIN_REPLICAS} and {MAX_REPLICAS}."
+            )
         )
+
+    current_replicas = state["replicas"]
+
+    # Detect unnecessary repeated call
+    if current_replicas == n:
+        return {
+            "status": "no_op",
+            "message": f"Replica count is already {n}.",
+            "replicas": current_replicas,
+        }
+
+    previous_replicas = current_replicas
 
     state["replicas"] = n
 
     return {
         "status": "success",
+        "previous_replicas": previous_replicas,
         "replicas": state["replicas"],
     }
