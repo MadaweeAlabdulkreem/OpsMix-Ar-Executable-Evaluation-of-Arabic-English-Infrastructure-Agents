@@ -11,12 +11,11 @@ SERVICE_NAMES = ("nginx", "redis", "api")
 
 
 def _initial_state() -> dict:
-    """Build one fresh copy of the starting state.
-
-    This is a function -- not a bare dictionary -- so that later
-    (outside today's scope) something could call it again to reset
-    the server back to a known starting point.
     """
+    Create and return a fresh copy of the sandbox's default state.
+    Using a function instead of a global dictionary ensures every reset
+    starts from a clean, independent state without sharing previous changes."""
+    
     return {
         "disk_total_gb": 10, # Total disk capacity
         "disk_used_gb": 8.2, # Current disk usage
@@ -39,6 +38,26 @@ def _initial_state() -> dict:
             }
             for name in SERVICE_NAMES
         },
+"metrics": {
+    "nginx": {
+        "cpu_percent": 18,
+        "memory_mb": 220
+    },
+    "redis": {
+        "cpu_percent": 12,
+        "memory_mb": 340
+    },
+    "api": {
+        "cpu_percent": 35,
+        "memory_mb": 512
+    }
+},
+
+"deployment": {
+    "current_version": "v1.1.0",
+    "previous_version": "v1.0.9"
+},
+        "history": [],  # List of all actions taken, in order
     }
 
 
