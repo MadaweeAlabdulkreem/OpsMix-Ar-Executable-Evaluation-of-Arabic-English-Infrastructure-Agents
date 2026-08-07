@@ -76,3 +76,6 @@ def restart_service(service: str):
         "last_restart": now,
     }
 
+@app.get("/history")
+def get_history():
+    return state["history"]
