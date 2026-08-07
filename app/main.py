@@ -8,6 +8,7 @@ restart_service() come in later steps.
 from __future__ import annotations
 import secrets
 from datetime import datetime, timezone
+
 from fastapi import FastAPI, HTTPException
 from app.state import state, SERVICE_NAMES
 
@@ -78,8 +79,7 @@ def restart_service(service: str):
     now = datetime.now(timezone.utc).isoformat()
     state["services"][service]["status"] = "running"
     state["services"][service]["last_restart"] = now
-    _record("restart_service", {"service": service})
-
+    _record("restart_service", {"service": service}, timestamp=now)
     return {
         "status": "success",
         "service": service,
