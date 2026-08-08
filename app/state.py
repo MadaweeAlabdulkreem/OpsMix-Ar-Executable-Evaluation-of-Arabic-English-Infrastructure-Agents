@@ -18,8 +18,7 @@ def _initial_state() -> dict:
     return {
         "disk_total_gb": 10,  # Total disk capacity
         "disk_used_gb": 8.2,  # Current disk usage
-        "cache_size_mb": 512,
-        # New state for the additional tools
+        "cache_size_mb": 512, # Cache size in MB
         # API key state
         "api_key": "initial-api-key",
         "api_key_last_rotated": None,

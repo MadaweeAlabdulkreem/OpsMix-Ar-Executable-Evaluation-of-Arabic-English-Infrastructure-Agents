@@ -6,6 +6,8 @@ restart_service() come in later steps.
 """
 
 from __future__ import annotations
+import copy 
+
 import secrets
 from datetime import datetime, timezone
 
@@ -26,6 +28,7 @@ def _record(tool: str, args: dict, timestamp: str | None = None) -> None:
             "tool": tool,
             "args": args,
             "timestamp": timestamp or datetime.now(timezone.utc).isoformat(),
+            "state_before": state_before,
         }
     )
 
@@ -33,8 +36,9 @@ def _record(tool: str, args: dict, timestamp: str | None = None) -> None:
 # The first tool: check_disk() Return current disk usage. Read-only
 @app.get("/check_disk")
 def check_disk():
+    state_before = copy.deepcopy(state)
     disk_usage_percent = (state["disk_used_gb"] / state["disk_total_gb"]) * 100
-    _record("check_disk", {})
+    _record("check_disk", {}, state_before=state_before)
 
     return {
         "disk_total_gb": state["disk_total_gb"],
@@ -47,11 +51,12 @@ def check_disk():
 # resource: https://onlinetoolsforge.com/en/tools/disk-usage-calculator/
 @app.post("/clear_cache")
 def clear_cache():
+    state_before = copy.deepcopy(state)
     freed_gb = state["cache_size_mb"] / 1024  # convert MB freed -> GB freed
 
     state["disk_used_gb"] = max(0, state["disk_used_gb"] - freed_gb)
     state["cache_size_mb"] = 0
-    _record("clear_cache", {})
+    _record("clear_cache", {}, state_before=state_before)
 
     disk_usage_percent = (state["disk_used_gb"] / state["disk_total_gb"]) * 100
 
@@ -76,10 +81,16 @@ def restart_service(service: str):
             ),
         )
 
+    state_before = copy.deepcopy(state)
+
     now = datetime.now(timezone.utc).isoformat()
+
     state["services"][service]["status"] = "running"
     state["services"][service]["last_restart"] = now
-    _record("restart_service", {"service": service}, timestamp=now)
+    state["services"][service]["restart_count"] += 1
+    
+    _record("restart_service", {"service": service}, timestamp=now, state_before=state_before)
+
     return {
         "status": "success",
         "service": service,
@@ -87,17 +98,17 @@ def restart_service(service: str):
     }
 
 
-# The fourth tool: rotate_api_key()
-# Generate a new API key and replace the existing one.
+# The fourth tool: rotate_api_key() - Generate a new API key and replace the existing one.
 @app.post("/rotate_api_key")
 def rotate_api_key():
+    state_before = copy.deepcopy(state)
     new_key = secrets.token_hex(32)
     rotated_at = datetime.now(timezone.utc).isoformat()
 
     state["api_key"] = new_key
     state["api_key_last_rotated"] = rotated_at
 
-    _record("rotate_api_key", {})
+    _record("rotate_api_key", {}, state_before=state_before)
 
     # Do NOT return the actual API key
     return {
@@ -110,7 +121,7 @@ def rotate_api_key():
 # The fifth tool: scale_replicas(n)
 # Scale the number of running replicas.
 @app.post("/scale_replicas")
-def scale_replicas(n: int):
+def scale_replicas(n: int): 
     if n < MIN_REPLICAS or n > MAX_REPLICAS:
         raise HTTPException(
             status_code=400,
@@ -130,10 +141,11 @@ def scale_replicas(n: int):
             "replicas": current_replicas,
         }
 
+    state_before = copy.deepcopy(state)
     previous_replicas = current_replicas
     state["replicas"] = n
 
-    _record("scale_replicas", {"n": n})
+    _record("scale_replicas", {"n": n}, state_before=state_before)
 
     return {
         "status": "success",
@@ -152,20 +164,23 @@ def get_metrics(service: str):
             detail=f"Service '{service}' is not supported.",
         )
 
-    _record("get_metrics", {"service": service})
+    state_before = copy.deepcopy(state)
+    _record("get_metrics", {"service": service}, state_before=state_before)
 
     return {"service": service, "metrics": state["metrics"][service]}
 
 
 @app.post("/rollback_deploy")
 def rollback_deploy():
+    state_before = copy.deepcopy(state)
+
     current = state["deployment"]["current_version"]
     previous = state["deployment"]["previous_version"]
 
     state["deployment"]["current_version"] = previous
     state["deployment"]["previous_version"] = current
 
-    _record("rollback_deploy", {})
+    _record("rollback_deploy", {}, state_before=state_before)
 
     return {"status": "success", "rolled_back_to": previous}
 
@@ -192,8 +207,8 @@ def get_logs(service: str, limit: int | None = None):
                 status_code=400, detail="limit must be a positive integer."
             )
         logs = logs[-limit:]
-
-    _record("get_logs", {"service": service, "limit": limit})
+    state_before = copy.deepcopy(state)  # read-only; snapshot for schema consistency
+    _record("get_logs", {"service": service, "limit": limit}, state_before=state_before)
 
     return {
         "service": service,
@@ -219,13 +234,14 @@ def kill_process(pid: int):
             "pid": pid,
         }
 
+    state_before = copy.deepcopy(state)  # captured BEFORE mutation below
     previous_status = process["status"]
     now = datetime.now(timezone.utc).isoformat()
 
     process["status"] = "killed"
     process["killed_at"] = now
 
-    _record("kill_process", {"pid": pid})
+    _record("kill_process", {"pid": pid}, state_before=state_before)
 
     return {
         "status": "success",
@@ -244,11 +260,12 @@ def set_config(key: str, value: str):
     if not key:
         raise HTTPException(status_code=400, detail="key must not be empty.")
 
+    state_before = copy.deepcopy(state)
     previous_value = state["config"].get(key)
 
     state["config"][key] = value
 
-    _record("set_config", {"key": key, "value": value})
+    _record("set_config", {"key": key, "value": value}, state_before=state_before)
 
     return {
         "status": "success",
