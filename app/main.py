@@ -22,12 +22,28 @@ MAX_REPLICAS = 10
 app = FastAPI(title="Tiny Infra Service")
 
 
-def _record(tool: str, args: dict, timestamp: str | None = None) -> None:
+#def _record(tool: str, args: dict, timestamp: str | None = None) -> None:
+   # state["history"].append(
+       # {
+           # "tool": tool,
+           # "args": args,
+            #"timestamp": timestamp or datetime.now(timezone.utc).isoformat(),
+            #"state_before": state_before,
+       # }
+    #)
+def _record(
+    tool: str,
+    args: dict,
+    timestamp: str | None = None,
+    state_before: dict | None = None
+) -> None:
+
     state["history"].append(
         {
             "tool": tool,
             "args": args,
-            "timestamp": timestamp or datetime.now(timezone.utc).isoformat(),
+            "timestamp": timestamp
+            or datetime.now(timezone.utc).isoformat(),
             "state_before": state_before,
         }
     )
