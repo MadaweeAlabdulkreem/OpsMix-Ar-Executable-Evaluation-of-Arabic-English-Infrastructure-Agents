@@ -1,196 +1,463 @@
 """
-agent.py
---------
-The "agent" decides which tool(s) to call given a natural-language
-request. This file currently contains a SIMULATED agent (deterministic
-keyword matching across English / MSA / Gulf Arabic / Mixed).
+GPT-powered agent for OpsMix-Ar.
 
-WHY simulated first:
-  - It is fast, free, and 100% reproducible for demoing the pipeline.
-  - It defines the exact CONTRACT (input -> list of tool calls) that a
-    real LLM must satisfy later. Swap `decide()` for `decide_with_llm()`
-    below and nothing else in the project needs to change.
+The agent receives:
+    - a natural-language user request
+    - language variant
+    - current sandbox state
+
+It asks an OpenAI model to choose zero or more infrastructure tools.
 
 Contract:
     decide(user_request: str, language: str, current_state: dict)
-        -> (steps: list[dict], intent: str|None, service: str|None)
+        -> (steps: list[dict], intent: str | None, service: str | None)
 
-    Each step in `steps` looks like:
-        {"tool": "<tool_name>", "args": {...}, "reasoning": "<why>"}
+Each step:
+    {
+        "tool": "<tool_name>",
+        "args": {...},
+        "reasoning": "<short explanation>"
+    }
+
+IMPORTANT:
+Tool names and argument names MUST match app/main.py exactly.
 """
 
+from __future__ import annotations
+
+import json
+import os
+
+from openai import OpenAI
+
+
 # ---------------------------------------------------------------------------
-# Keyword dictionaries covering English, MSA, Gulf Arabic, and mixed usage.
-# Matching is deliberately simple substring matching -- good enough for a
-# deterministic demo agent, and language-agnostic on purpose: real mixed
-# Arabic-English sentences often blend scripts mid-sentence.
+# OpenAI configuration
 # ---------------------------------------------------------------------------
-SERVICE_KEYWORDS = {
-    "payment": ["payment", "الدفع", "دفع", "الپايمنت", "payment service"],
-    "database": ["database", "db ", " db", "قاعدة البيانات", "قاعدة بيانات", "الداتابيس", "داتا بيس"],
-    "api": ["api", "الـ api", "خدمة api", "خدمة ال api"],
-}
 
-INTENT_KEYWORDS = {
-    # "turn it on / restart / fix it / it's down, start it"
-    "restart": [
-        "restart", "turn it on", "turn on", "start it", "start the",
-        "شغل", "شغلها", "شغّل", "شغّلها", "فعل", "فعّل", "شغلها لي", "قم بتشغيل",
-    ],
-    "stop": [
-        "stop", "shut down", "shutdown", "turn it off", "turn off",
-        "وقف", "أوقف", "اوقف", "وقفها", "أوقفها",
-    ],
-    "check_status": [
-        "status", "check status", "what's the status", "is it running",
-        "وش وضع", "ايش وضع", "تحقق من", "الحالة", "وضع الخدمة", "شو وضع",
-    ],
-    "clear_cache": [
-        "cache", "clear cache", "clear the cache",
-        "كاش", "امسح الكاش", "نظف الكاش", "امسح الكاش تبع",
-    ],
-    "rotate_key": [
-        "rotate key", "rotate the api key", "api key", "new key",
-        "مفتاح", "غير المفتاح", "غيّر المفتاح", "دور المفتاح", "غير مفتاح",
-    ],
-    "disk_usage": [
-        "disk", "disk usage", "storage",
-        "مساحة القرص", "مساحة التخزين", "القرص", "مساحة الهارد",
-    ],
-}
-
-# Extra "problem" signal words (Gulf/MSA) that reinforce a restart intent,
-# e.g. "خدمة الدفع طافية" = "the payment service is down/off".
-DOWN_SIGNAL_WORDS = ["طافية", "طافي", "واقفة", "واقف", "down", "not working", "مو شغالة", "معطلة"]
+OPENAI_MODEL = os.environ.get(
+    "OPENAI_MODEL",
+    "gpt-5.5",
+)
 
 
-def _normalize(text: str) -> str:
-    return text.strip().lower()
+def _get_client():
+    """
+    Create the OpenAI client using OPENAI_API_KEY from the environment.
+    """
+
+    api_key = os.environ.get("OPENAI_API_KEY")
+
+    if not api_key:
+        raise RuntimeError(
+            "OPENAI_API_KEY is not set. "
+            "Set it in your terminal before running the app."
+        )
+
+    return OpenAI(api_key=api_key)
 
 
-def detect_service(text: str):
-    for service, keywords in SERVICE_KEYWORDS.items():
-        for kw in keywords:
-            if kw in text:
-                return service
+# ---------------------------------------------------------------------------
+# Tool schemas
+# These MUST match app/main.py exactly.
+# ---------------------------------------------------------------------------
+
+TOOLS = [
+    {
+        "type": "function",
+        "name": "check_disk",
+        "description": (
+            "Check current disk usage. "
+            "Use this when the user asks about disk space, "
+            "storage usage, or disk capacity."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    },
+
+    {
+        "type": "function",
+        "name": "clear_cache",
+        "description": (
+            "Clear the server cache. "
+            "This reduces cache_size_mb to zero and frees disk space."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    },
+
+    {
+        "type": "function",
+        "name": "restart_service",
+        "description": (
+            "Restart one supported service. "
+            "Supported services are nginx, redis, and api."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "service": {
+                    "type": "string",
+                    "enum": [
+                        "nginx",
+                        "redis",
+                        "api",
+                    ],
+                    "description": "Service to restart.",
+                }
+            },
+            "required": [
+                "service",
+            ],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    },
+
+    {
+        "type": "function",
+        "name": "rotate_api_key",
+        "description": (
+            "Rotate the API key and replace the existing credential. "
+            "Use when a key is exposed, compromised, leaked, "
+            "or the user explicitly asks for key rotation."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    },
+
+    {
+        "type": "function",
+        "name": "scale_replicas",
+        "description": (
+            "Set the number of running replicas. "
+            "The value must be between 1 and 10."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "n": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 10,
+                    "description": "Desired number of replicas.",
+                }
+            },
+            "required": [
+                "n",
+            ],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    },
+
+    {
+        "type": "function",
+        "name": "get_metrics",
+        "description": (
+            "Read CPU and memory metrics for nginx, redis, or api."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "service": {
+                    "type": "string",
+                    "enum": [
+                        "nginx",
+                        "redis",
+                        "api",
+                    ],
+                }
+            },
+            "required": [
+                "service",
+            ],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    },
+
+    {
+        "type": "function",
+        "name": "rollback_deploy",
+        "description": (
+            "Rollback the current deployment to the previous version."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    },
+
+    {
+        "type": "function",
+        "name": "get_logs",
+        "description": (
+            "Read recent logs for nginx, redis, or api. "
+            "Optionally limit the number of returned log entries."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "service": {
+                    "type": "string",
+                    "enum": [
+                        "nginx",
+                        "redis",
+                        "api",
+                    ],
+                },
+                "limit": {
+                    "type": [
+                        "integer",
+                        "null",
+                    ],
+                    "minimum": 1,
+                    "description": (
+                        "Maximum number of recent log entries, "
+                        "or null if no limit is requested."
+                    ),
+                },
+            },
+            "required": [
+                "service",
+                "limit",
+            ],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    },
+
+    {
+        "type": "function",
+        "name": "kill_process",
+        "description": (
+            "Kill a running process by its PID. "
+            "Use only when terminating a process is actually required."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "pid": {
+                    "type": "integer",
+                    "description": "PID of the process to terminate.",
+                }
+            },
+            "required": [
+                "pid",
+            ],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    },
+
+    {
+        "type": "function",
+        "name": "set_config",
+        "description": (
+            "Set or overwrite a configuration key with a string value."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "key": {
+                    "type": "string",
+                    "description": "Configuration key.",
+                },
+                "value": {
+                    "type": "string",
+                    "description": "New configuration value.",
+                },
+            },
+            "required": [
+                "key",
+                "value",
+            ],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    },
+]
+
+
+# ---------------------------------------------------------------------------
+# Prompt
+# ---------------------------------------------------------------------------
+
+SYSTEM_INSTRUCTIONS = """
+You are an infrastructure operations tool-calling agent being evaluated
+as part of the OpsMix-Ar benchmark.
+
+You will receive:
+1. A user request.
+2. Its language variant.
+3. The CURRENT sandbox state.
+
+The user request may be:
+- English
+- Modern Standard Arabic
+- Gulf Arabic
+- mixed Arabic-English
+
+Your job is to decide which available infrastructure tool or tools
+should be called.
+
+Important rules:
+
+1. Use ONLY the tools provided to you.
+2. Never invent tool names or arguments.
+3. Tool names and argument names must match the schemas exactly.
+4. Consider the current sandbox state before deciding.
+5. Do not perform unnecessary actions.
+6. Do not call a destructive tool merely because it is available.
+7. If the request only asks to inspect something, prefer a read-only tool.
+8. If no tool call is appropriate, make no tool call.
+9. Understand Gulf Arabic naturally, including informal phrasing
+   and Arabic-English code switching.
+10. Do not use benchmark gold answers. You do not receive them.
+11. Do not explain your decision in normal text when a tool call is needed.
+    Select the appropriate tool call instead.
+
+This is an evaluation environment. Tool calls will execute only against
+a sandbox, not real infrastructure.
+"""
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _safe_state_for_model(current_state: dict) -> dict:
+    """
+    Remove evaluation-only history before sending state to the model.
+
+    The agent should see the infrastructure state, but it does not need
+    previous tool-call history from the checker pipeline.
+    """
+
+    clean_state = dict(current_state)
+    clean_state.pop("history", None)
+
+    return clean_state
+
+
+def _infer_service(steps: list) -> str | None:
+    """
+    Infer service metadata from returned tool calls.
+    This is only for the UI; checker.py does not grade this field.
+    """
+
+    for step in steps:
+        service = step.get("args", {}).get("service")
+
+        if service in {
+            "nginx",
+            "redis",
+            "api",
+        }:
+            return service
+
     return None
 
 
-def detect_intent(text: str):
-    for intent, keywords in INTENT_KEYWORDS.items():
-        for kw in keywords:
-            if kw in text:
-                return intent
-    # If nothing matched but a "down" signal word is present, assume restart
-    for kw in DOWN_SIGNAL_WORDS:
-        if kw in text:
-            return "restart"
-    return None
+def _infer_intent(steps: list) -> str | None:
+    """
+    Use the first selected tool as the intent label.
+    """
+
+    if not steps:
+        return None
+
+    return steps[0]["tool"]
 
 
-def decide(user_request: str, language: str, current_state: dict):
+# ---------------------------------------------------------------------------
+# GPT agent
+# ---------------------------------------------------------------------------
+
+def decide(
+    user_request: str,
+    language: str,
+    current_state: dict,
+):
     """
-    SIMULATED AGENT.
-    `language` is accepted for interface parity with the real-LLM version
-    (a real LLM adapter would use it to pick a system prompt / few-shot
-    examples per language variant). The simulated agent itself matches
-    keywords across all variants regardless of the selected language.
+    Ask GPT to select infrastructure tools.
+
+    Returns:
+        (steps, intent, service)
+
+    This preserves the exact interface expected by ui.py and the rest
+    of the OpsMix-Ar evaluation pipeline.
     """
-    text = _normalize(user_request)
-    service = detect_service(text)
-    intent = detect_intent(text)
+
+    client = _get_client()
+
+    clean_state = _safe_state_for_model(
+        current_state
+    )
+
+    model_input = (
+        f"Language variant: {language}\n\n"
+        f"Current sandbox state:\n"
+        f"{json.dumps(clean_state, ensure_ascii=False, indent=2)}\n\n"
+        f"User request:\n"
+        f"{user_request}"
+    )
+
+    response = client.responses.create(
+        model=OPENAI_MODEL,
+        instructions=SYSTEM_INSTRUCTIONS,
+        input=model_input,
+        tools=TOOLS,
+        tool_choice="auto",
+    )
 
     steps = []
 
-    # disk_usage is a server-level check, not tied to a specific service
-    if intent == "disk_usage":
-        steps = [
-            {"tool": "check_disk_usage", "args": {"server_name": "main"},
-             "reasoning": "User asked about disk usage."},
-        ]
-        return steps, intent, service
+    for item in response.output:
 
-    if service is None or intent is None:
-        return steps, intent, service
+        if getattr(item, "type", None) != "function_call":
+            continue
 
-    if intent == "restart":
-        steps = [
-            {"tool": "check_service_status", "args": {"service_name": service},
-             "reasoning": "Verify current status before restarting."},
-            {"tool": "restart_service", "args": {"service_name": service},
-             "reasoning": "User asked to turn the service back on."},
-        ]
-    elif intent == "stop":
-        steps = [
-            {"tool": "check_service_status", "args": {"service_name": service},
-             "reasoning": "Verify current status before stopping."},
-            {"tool": "stop_service", "args": {"service_name": service},
-             "reasoning": "User asked to stop the service."},
-        ]
-    elif intent == "check_status":
-        steps = [
-            {"tool": "check_service_status", "args": {"service_name": service},
-             "reasoning": "User asked for a status check only."},
-        ]
-    elif intent == "clear_cache":
-        steps = [
-            {"tool": "check_disk_usage", "args": {"server_name": "main"},
-             "reasoning": "Check disk usage before clearing cache."},
-            {"tool": "clear_cache", "args": {"service_name": service},
-             "reasoning": "User asked to clear the cache."},
-        ]
-    elif intent == "rotate_key":
-        steps = [
-        {
-            "tool": "rotate_api_key",
-            "args": {},
-            "reasoning": "User asked to rotate the API key."
-        },
-    ]
+        tool_name = item.name
+
+        raw_arguments = item.arguments
+
+        if isinstance(raw_arguments, str):
+            args = json.loads(raw_arguments)
+        else:
+            args = raw_arguments or {}
+
+        steps.append(
+            {
+                "tool": tool_name,
+                "args": args,
+                "reasoning": (
+                    "Selected by the GPT agent based on the "
+                    "user request and current sandbox state."
+                ),
+            }
+        )
+
+    intent = _infer_intent(steps)
+    service = _infer_service(steps)
+
     return steps, intent, service
-
-
-# ---------------------------------------------------------------------------
-# =====================  LLM INTEGRATION POINT (RunPod)  =====================
-# To replace the simulated agent with a real open-source LLM served on
-# RunPod (e.g. an OpenAI-compatible vLLM / TGI endpoint), implement a
-# function with the SAME return contract as `decide()` above, and swap the
-# call site in app.py from `agent.decide(...)` to `agent.decide_with_llm(...)`.
-#
-# Sketch (left unimplemented on purpose -- no live network calls in this demo):
-#
-# import requests
-#
-# RUNPOD_ENDPOINT = "https://<your-runpod-id>.proxy.runpod.net/v1/chat/completions"
-#
-# TOOL_SCHEMA = [
-#     {"name": "check_service_status", "parameters": {"service_name": "str"}},
-#     {"name": "restart_service", "parameters": {"service_name": "str"}},
-#     {"name": "stop_service", "parameters": {"service_name": "str"}},
-#     {"name": "check_disk_usage", "parameters": {"server_name": "str"}},
-#     {"name": "clear_cache", "parameters": {"service_name": "str"}},
-#     {"name": "rotate_api_key", "parameters": {"service_name": "str"}},
-# ]
-#
-# def decide_with_llm(user_request: str, language: str, current_state: dict):
-#     system_prompt = build_system_prompt(language, TOOL_SCHEMA, current_state)
-#     response = requests.post(
-#         RUNPOD_ENDPOINT,
-#         json={
-#             "model": "your-open-source-model",
-#             "messages": [
-#                 {"role": "system", "content": system_prompt},
-#                 {"role": "user", "content": user_request},
-#             ],
-#             "tools": TOOL_SCHEMA,
-#         },
-#         timeout=60,
-#     )
-#     tool_calls = parse_tool_calls(response.json())  # -> list of {"tool", "args", "reasoning"}
-#     intent, service = infer_intent_service_from_calls(tool_calls)  # for the validator
-#     return tool_calls, intent, service
-#
-# Everything downstream (sandbox execution, trace UI, validator) is already
-# written against the `(steps, intent, service)` contract, so no other file
-# needs to change when you plug this in.
-# ==============================================================================
