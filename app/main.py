@@ -1,3 +1,5 @@
+#main.py 
+
 """FastAPI app exposing the tiny infra service's tools as HTTP endpoints.
 
 Each tool from the project spec becomes exactly one endpoint here.
@@ -13,6 +15,7 @@ from datetime import datetime, timezone
 
 from fastapi import FastAPI, HTTPException
 from app.state import state, SERVICE_NAMES
+from app.reset import reset
 
 # Constants for replica scaling constraints
 MIN_REPLICAS = 1
@@ -137,31 +140,40 @@ def rotate_api_key():
 # The fifth tool: scale_replicas(n)
 # Scale the number of running replicas.
 @app.post("/scale_replicas")
-def scale_replicas(n: int): 
+def scale_replicas(n: int):
     if n < MIN_REPLICAS or n > MAX_REPLICAS:
         raise HTTPException(
             status_code=400,
             detail=(
-                f"Replica count must be between {MIN_REPLICAS} and"
-                f" {MAX_REPLICAS}."
+                f"Replica count must be between {MIN_REPLICAS} and "
+                f"{MAX_REPLICAS}."
             ),
         )
 
+    state_before = copy.deepcopy(state)
     current_replicas = state["replicas"]
 
-    # Detect unnecessary repeated call
     if current_replicas == n:
+        _record(
+            "scale_replicas",
+            {"n": n},
+            state_before=state_before,
+        )
+
         return {
             "status": "no_op",
             "message": f"Replica count is already {n}.",
             "replicas": current_replicas,
         }
 
-    state_before = copy.deepcopy(state)
     previous_replicas = current_replicas
     state["replicas"] = n
 
-    _record("scale_replicas", {"n": n}, state_before=state_before)
+    _record(
+        "scale_replicas",
+        {"n": n},
+        state_before=state_before,
+    )
 
     return {
         "status": "success",
@@ -239,25 +251,37 @@ def kill_process(pid: int):
 
     if process is None:
         raise HTTPException(
-            status_code=404, detail=f"No process found with pid {pid}."
+            status_code=404,
+            detail=f"No process found with pid {pid}.",
         )
 
-    # Detect unnecessary repeated call
+    state_before = copy.deepcopy(state)
+
     if process["status"] == "killed":
+        _record(
+            "kill_process",
+            {"pid": pid},
+            state_before=state_before,
+        )
+
         return {
             "status": "no_op",
             "message": f"Process {pid} is already killed.",
             "pid": pid,
         }
 
-    state_before = copy.deepcopy(state)  # captured BEFORE mutation below
     previous_status = process["status"]
     now = datetime.now(timezone.utc).isoformat()
 
     process["status"] = "killed"
     process["killed_at"] = now
 
-    _record("kill_process", {"pid": pid}, state_before=state_before)
+    _record(
+        "kill_process",
+        {"pid": pid},
+        timestamp=now,
+        state_before=state_before,
+    )
 
     return {
         "status": "success",
@@ -266,7 +290,6 @@ def kill_process(pid: int):
         "previous_status": previous_status,
         "killed_at": now,
     }
-
 
 # set_config(key, value) -- Set (or overwrite) a config key.
 @app.post("/set_config")
@@ -290,7 +313,34 @@ def set_config(key: str, value: str):
         "previous_value": previous_value,
     }
 
+@app.post("/reset/{task_id}")
+def reset_endpoint(task_id: str):
+    try:
+        reset(task_id)
+    except KeyError:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Unknown task_id '{task_id}'"
+        )
+    return {"status": "reset", "task_id": task_id}
+
+
+@app.get("/state")
+def get_state():
+    return state
 
 @app.get("/history")
 def get_history():
     return state["history"]
+
+@app.get("/check/{task_id}")
+def check_task(task_id: str):
+    from app.checker import check
+
+    try:
+        return check(task_id)
+    except KeyError:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Unknown task_id '{task_id}'"
+        )
