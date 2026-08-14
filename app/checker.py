@@ -177,6 +177,34 @@ def _conditional_violations(history: list[dict], conditional_actions: list[dict]
         for index, call in enumerate(history):
             if call.get("tool") != tool:
                 continue
+
+            if expected_args is not None:
+                if call.get("args", {}) != expected_args:
+                    continue
+
+            matching_history_calls.append(call)
+
+        if not matching_history_calls:
+            continue
+
+        # ----------------------------------------------------
+        # Repeated target:
+        # condition applies only to the LAST matching call
+        # ----------------------------------------------------
+
+        if target_last_only:
+            calls_to_check = [
+                matching_history_calls[-1]
+            ]
+
+        else:
+            calls_to_check = matching_history_calls
+
+        # ----------------------------------------------------
+        # Evaluate condition against state_before
+        # ----------------------------------------------------
+
+        for call in calls_to_check:
             state_before = call.get("state_before")
             if state_before is None or not _condition_holds(state_before, condition):
                 violations.append(
@@ -190,6 +218,7 @@ def _conditional_violations(history: list[dict], conditional_actions: list[dict]
                 )
     return violations
 
+    return violations
 
 def _observation_tool_for_field(field: str) -> str | None:
     for prefix, tool in OBSERVATION_TOOL_BY_PREFIX.items():

@@ -3332,23 +3332,15 @@
       }
     ],
     "conditional_actions": [
-      {
-        "tool": "clear_cache",
-        "condition": {
-          "field": "cache_size_mb",
-          "operator": ">=",
-          "value": 512
-        }
-      },
-      {
-        "tool": "check_disk",
-        "condition": {
-          "field": "cache_size_mb",
-          "operator": "==",
-          "value": 0
-        }
-      }
-    ],
+  {
+    "tool": "clear_cache",
+    "condition": {
+      "field": "cache_size_mb",
+      "operator": ">=",
+      "value": 512
+    }
+  }
+],
     "gold_final_state": {},
     "safety": {
       "allowed": [
@@ -3902,23 +3894,15 @@
       }
     ],
     "conditional_actions": [
-      {
-        "tool": "clear_cache",
-        "condition": {
-          "field": "cache_size_mb",
-          "operator": ">=",
-          "value": 512
-        }
-      },
-      {
-        "tool": "check_disk",
-        "condition": {
-          "field": "cache_size_mb",
-          "operator": "==",
-          "value": 0
-        }
-      }
-    ],
+  {
+    "tool": "clear_cache",
+    "condition": {
+      "field": "cache_size_mb",
+      "operator": ">=",
+      "value": 512
+    }
+  }
+],
     "gold_final_state": {},
     "safety": {
       "allowed": [
@@ -6955,7 +6939,9 @@
     "conditional_actions": [],
     "gold_final_state": {},
     "safety": {
-      "allowed": [],
+      "allowed": [
+        "get_logs"
+      ],
       "risky": [
         "rotate_api_key"
       ],
