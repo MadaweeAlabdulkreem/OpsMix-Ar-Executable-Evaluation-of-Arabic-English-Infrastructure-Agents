@@ -1,48 +1,19 @@
-"""
-app/evaluate.py
+"""OpsMix-Ar executable evaluation harness.
 
-OpsMix-Ar evaluation harness.
+The dataset schema is unchanged. This evaluator improves the scoring layer by:
 
-Purpose
--------
-Evaluate externally generated LLM tool calls against the real
-Tiny Infra Service sandbox.
+* executing predicted calls against the real HTTP sandbox;
+* preserving attempted calls even when the server rejects them;
+* separating exact path, valid path, and suboptimal path;
+* reporting independent tool and argument metrics;
+* preserving conditional/precondition violations;
+* distinguishing risky actions from actual safety violations;
+* classifying unsafe success / dangerous failure explicitly;
+* recording per-call latency and aggregate execution time;
+* optionally consuming an interactive trace file so retry/recovery can be
+  evaluated when such a trace exists.
 
-Pipeline
---------
-Qwen predictions
-        |
-        v
-evaluate.py
-        |
-        v
-HTTP API (main.py)
-        |
-        +--> reset task
-        |
-        +--> execute predicted tool calls
-        |
-        +--> collect /history
-        |
-        +--> collect /state
-        |
-        v
-checker.py
-        |
-        v
-evaluation_results.json
-evaluation_summary.json
-
-Qwen runs separately, for example in Google Colab.
-The output from Qwen is saved as JSON and passed to this evaluator.
-
-The evaluator:
-1. Resets the sandbox.
-2. Executes Qwen's predicted tool calls through HTTP.
-3. Collects the REAL sandbox state and history.
-4. Synchronizes those values into the local checker state.
-5. Runs the existing checker.
-6. Computes task-level and aggregate metrics.
+The existing one-shot predictions JSON format remains supported unchanged.
 """
 
 from __future__ import annotations
@@ -52,6 +23,7 @@ import copy
 import json
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -61,26 +33,10 @@ from app.checker import check
 from app.state import state as LOCAL_STATE
 from app.tasks import TASKS_BY_ID, get_task
 
-
-# ============================================================
-# Configuration
-# ============================================================
-
-BASE_URL = os.getenv(
-    "TINY_INFRA_BASE_URL",
-    "http://127.0.0.1:8000",
-)
-
+BASE_URL = os.getenv("TINY_INFRA_BASE_URL", "http://127.0.0.1:8000")
 DEFAULT_TIMEOUT = 30.0
-
 RESULTS_DIR = Path("results")
-
 LANGUAGES = ("en", "msa", "gulf", "mixed")
-
-
-# ============================================================
-# Tool -> HTTP endpoint mapping
-# ============================================================
 
 TOOL_ENDPOINTS: dict[str, tuple[str, str]] = {
     "check_disk": ("GET", "/check_disk"),
@@ -95,77 +51,28 @@ TOOL_ENDPOINTS: dict[str, tuple[str, str]] = {
     "set_config": ("POST", "/set_config"),
 }
 
-
-SENSITIVE_KEYS = {
-    "api_key",
-}
+SENSITIVE_KEYS = {"api_key"}
 
 
 class EvaluatorError(Exception):
-    """Evaluator-level failure.
+    """Evaluator infrastructure failure, not a model/tool failure."""
 
-    Examples:
-    - sandbox server is unreachable
-    - reset endpoint failed
-    - state/history cannot be collected
-
-    A normal HTTP 400/404/500 returned by a tool is NOT an
-    evaluator failure. It is a valid model/tool-call result.
-    """
-
-
-# ============================================================
-# Sanitization
-# ============================================================
 
 def _sanitize(obj: Any) -> Any:
-    """
-    Recursively redact sensitive values.
-
-    This creates a new object and never modifies the live state.
-    """
-
     if isinstance(obj, dict):
-        result = {}
-
-        for key, value in obj.items():
-            if key in SENSITIVE_KEYS and isinstance(value, str):
-                result[key] = "***REDACTED***"
-            else:
-                result[key] = _sanitize(value)
-
-        return result
-
+        return {
+            key: ("***REDACTED***" if key in SENSITIVE_KEYS and isinstance(value, str) else _sanitize(value))
+            for key, value in obj.items()
+        }
     if isinstance(obj, list):
         return [_sanitize(item) for item in obj]
-
     return obj
 
 
-# ============================================================
-# HTTP helpers
-# ============================================================
-
-def _build_query_params(
-    tool: str,
-    args: dict[str, Any],
-) -> dict[str, Any]:
-    """
-    Convert the model's tool-call arguments into query parameters.
-
-    main.py defines tool arguments as normal FastAPI parameters,
-    so both GET and POST calls use query parameters.
-
-    Special case:
-    get_logs(limit=None) must OMIT the limit parameter entirely.
-    """
-
+def _build_query_params(tool: str, args: dict[str, Any]) -> dict[str, Any]:
     params = dict(args or {})
-
-    if tool == "get_logs":
-        if params.get("limit") is None:
-            params.pop("limit", None)
-
+    if tool == "get_logs" and params.get("limit") is None:
+        params.pop("limit", None)
     return params
 
 
@@ -176,12 +83,8 @@ def call_tool(
     base_url: str = BASE_URL,
     timeout: float = DEFAULT_TIMEOUT,
 ) -> dict[str, Any]:
-    """
-    Execute ONE predicted tool call through the HTTP sandbox.
-
-    HTTP errors such as 400/404/500 are recorded as model/tool
-    execution results rather than crashing the evaluator.
-    """
+    """Execute one attempted model call and record wall-clock latency."""
+    start = time.perf_counter()
 
     if not isinstance(tool, str):
         return {
@@ -189,9 +92,9 @@ def call_tool(
             "args": args,
             "status_code": None,
             "ok": False,
-            "response": {
-                "detail": "Tool name must be a string."
-            },
+            "recorded_by_sandbox": False,
+            "duration_ms": round((time.perf_counter() - start) * 1000, 3),
+            "response": {"detail": "Tool name must be a string."},
         }
 
     if not isinstance(args, dict):
@@ -200,9 +103,9 @@ def call_tool(
             "args": args,
             "status_code": None,
             "ok": False,
-            "response": {
-                "detail": "Tool args must be an object."
-            },
+            "recorded_by_sandbox": False,
+            "duration_ms": round((time.perf_counter() - start) * 1000, 3),
+            "response": {"detail": "Tool args must be an object."},
         }
 
     if tool not in TOOL_ENDPOINTS:
@@ -211,598 +114,360 @@ def call_tool(
             "args": args,
             "status_code": None,
             "ok": False,
-            "response": {
-                "detail": f"Unknown tool '{tool}'."
-            },
+            "recorded_by_sandbox": False,
+            "duration_ms": round((time.perf_counter() - start) * 1000, 3),
+            "response": {"detail": f"Unknown tool '{tool}'."},
         }
 
     method, path = TOOL_ENDPOINTS[tool]
-
     url = base_url.rstrip("/") + path
-
-    params = _build_query_params(
-        tool=tool,
-        args=args,
-    )
+    params = _build_query_params(tool, args)
 
     try:
         if method == "GET":
-            response = session.get(
-                url,
-                params=params,
-                timeout=timeout,
-            )
-
+            response = session.get(url, params=params, timeout=timeout)
         elif method == "POST":
-            response = session.post(
-                url,
-                params=params,
-                timeout=timeout,
-            )
-
+            response = session.post(url, params=params, timeout=timeout)
         else:
-            raise EvaluatorError(
-                f"Unsupported HTTP method '{method}' "
-                f"for tool '{tool}'."
-            )
-
+            raise EvaluatorError(f"Unsupported HTTP method '{method}' for '{tool}'.")
     except requests.exceptions.RequestException as exc:
-        raise EvaluatorError(
-            f"Could not reach sandbox at {url}: {exc}"
-        ) from exc
+        raise EvaluatorError(f"Could not reach sandbox at {url}: {exc}") from exc
 
     try:
         body = response.json()
-
     except ValueError:
-        body = {
-            "detail": response.text
-        }
+        body = {"detail": response.text}
 
+    duration_ms = round((time.perf_counter() - start) * 1000, 3)
+
+    # The sandbox records successful/accepted tool executions in state.history.
+    # A rejected 4xx/5xx call normally does not appear there.
     return {
         "tool": tool,
         "args": args,
         "status_code": response.status_code,
         "ok": response.ok,
+        "recorded_by_sandbox": bool(response.ok),
+        "duration_ms": duration_ms,
         "response": body,
     }
 
 
-# ============================================================
-# Sandbox endpoints
-# ============================================================
-
-def reset_task_http(
-    session: requests.Session,
-    task_id: str,
-    base_url: str = BASE_URL,
-    timeout: float = DEFAULT_TIMEOUT,
-) -> None:
-    """
-    Reset the real FastAPI sandbox to the task's initial state.
-    """
-
-    url = (
-        base_url.rstrip("/")
-        + f"/reset/{task_id}"
-    )
-
+def reset_task_http(session: requests.Session, task_id: str, base_url: str = BASE_URL, timeout: float = DEFAULT_TIMEOUT) -> None:
+    url = base_url.rstrip("/") + f"/reset/{task_id}"
     try:
-        response = session.post(
-            url,
-            timeout=timeout,
-        )
-
+        response = session.post(url, timeout=timeout)
     except requests.exceptions.RequestException as exc:
-        raise EvaluatorError(
-            f"Could not reach reset endpoint: {exc}"
-        ) from exc
-
+        raise EvaluatorError(f"Could not reach reset endpoint: {exc}") from exc
     if not response.ok:
         raise EvaluatorError(
-            f"Reset failed for task '{task_id}': "
-            f"HTTP {response.status_code} - {response.text}"
+            f"Reset failed for task '{task_id}': HTTP {response.status_code} - {response.text}"
         )
 
 
-def get_history_http(
-    session: requests.Session,
-    base_url: str = BASE_URL,
-    timeout: float = DEFAULT_TIMEOUT,
-) -> list[dict[str, Any]]:
-    """
-    Retrieve the REAL sandbox history.
-    """
-
-    url = (
-        base_url.rstrip("/")
-        + "/history"
-    )
-
+def get_history_http(session: requests.Session, base_url: str = BASE_URL, timeout: float = DEFAULT_TIMEOUT) -> list[dict[str, Any]]:
+    url = base_url.rstrip("/") + "/history"
     try:
-        response = session.get(
-            url,
-            timeout=timeout,
-        )
+        response = session.get(url, timeout=timeout)
         response.raise_for_status()
-
-    except requests.exceptions.RequestException as exc:
-        raise EvaluatorError(
-            f"Could not retrieve /history: {exc}"
-        ) from exc
-
-    try:
         history = response.json()
-
-    except ValueError as exc:
-        raise EvaluatorError(
-            "The /history endpoint did not return valid JSON."
-        ) from exc
-
+    except (requests.exceptions.RequestException, ValueError) as exc:
+        raise EvaluatorError(f"Could not retrieve valid /history: {exc}") from exc
     if not isinstance(history, list):
-        raise EvaluatorError(
-            "/history must return a JSON list."
-        )
-
+        raise EvaluatorError("/history must return a JSON list.")
     return history
 
 
-def get_state_http(
-    session: requests.Session,
-    base_url: str = BASE_URL,
-    timeout: float = DEFAULT_TIMEOUT,
-) -> dict[str, Any]:
-    """
-    Retrieve the REAL sandbox state.
-    """
-
-    url = (
-        base_url.rstrip("/")
-        + "/state"
-    )
-
+def get_state_http(session: requests.Session, base_url: str = BASE_URL, timeout: float = DEFAULT_TIMEOUT) -> dict[str, Any]:
+    url = base_url.rstrip("/") + "/state"
     try:
-        response = session.get(
-            url,
-            timeout=timeout,
-        )
+        response = session.get(url, timeout=timeout)
         response.raise_for_status()
-
-    except requests.exceptions.RequestException as exc:
-        raise EvaluatorError(
-            f"Could not retrieve /state: {exc}"
-        ) from exc
-
-    try:
         sandbox_state = response.json()
-
-    except ValueError as exc:
-        raise EvaluatorError(
-            "The /state endpoint did not return valid JSON."
-        ) from exc
-
+    except (requests.exceptions.RequestException, ValueError) as exc:
+        raise EvaluatorError(f"Could not retrieve valid /state: {exc}") from exc
     if not isinstance(sandbox_state, dict):
-        raise EvaluatorError(
-            "/state must return a JSON object."
-        )
-
+        raise EvaluatorError("/state must return a JSON object.")
     return sandbox_state
 
 
-# ============================================================
-# Synchronize remote sandbox with local checker
-# ============================================================
-
-def _sync_checker_state(
-    remote_state: dict[str, Any],
-) -> dict[str, Any]:
-    """
-    Synchronize the state returned by the REAL FastAPI server
-    into the local state object used by checker.py.
-
-    Why this is necessary
-    ---------------------
-    evaluate.py and uvicorn/main.py normally run in separate
-    Python processes.
-
-    Therefore:
-
-        FastAPI state != evaluator process state
-
-    unless we explicitly synchronize them.
-
-    The checker itself remains the source of truth for grading.
-    We only provide it with the actual state/history collected
-    from the sandbox.
-    """
-
+def _sync_checker_state(remote_state: dict[str, Any], grading_history: list[dict[str, Any]] | None = None, *, retry_count: int = 0, recovery_success: bool = False, execution_errors: list[str] | None = None) -> dict[str, Any]:
     previous_state = copy.deepcopy(LOCAL_STATE)
-
     LOCAL_STATE.clear()
-    LOCAL_STATE.update(
-        copy.deepcopy(remote_state)
-    )
-
+    LOCAL_STATE.update(copy.deepcopy(remote_state))
+    LOCAL_STATE["history"] = copy.deepcopy(grading_history if grading_history is not None else remote_state.get("history", []))
+    LOCAL_STATE["evaluation_retry_count"] = retry_count
+    LOCAL_STATE["evaluation_recovery_success"] = recovery_success
+    LOCAL_STATE["evaluation_execution_errors"] = list(execution_errors or [])
     return previous_state
 
 
-def _restore_checker_state(
-    previous_state: dict[str, Any],
-) -> None:
-    """
-    Restore the evaluator process's original local state.
-    """
-
+def _restore_checker_state(previous_state: dict[str, Any]) -> None:
     LOCAL_STATE.clear()
-    LOCAL_STATE.update(
-        copy.deepcopy(previous_state)
-    )
+    LOCAL_STATE.update(copy.deepcopy(previous_state))
+
+
+def _call_signature(call: dict[str, Any]) -> tuple[Any, str]:
+    return call.get("tool"), json.dumps(call.get("args", {}), sort_keys=True, ensure_ascii=False)
+
+
+def _build_grading_history(predicted_calls: list[dict[str, Any]], remote_history: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Align all attempted calls to sandbox-recorded calls.
+
+    Rejected/unknown calls are preserved as synthetic history entries, so
+    safety/path evaluation cannot accidentally ignore an attempted forbidden
+    or unknown tool merely because FastAPI rejected it before recording it.
+    """
+    used: set[int] = set()
+    grading_history = []
+
+    for predicted in predicted_calls:
+        signature = _call_signature(predicted)
+        match_index = None
+        for idx, recorded in enumerate(remote_history):
+            if idx in used:
+                continue
+            if _call_signature(recorded) == signature:
+                match_index = idx
+                break
+
+        if match_index is not None:
+            used.add(match_index)
+            grading_history.append(copy.deepcopy(remote_history[match_index]))
+        else:
+            grading_history.append({
+                "tool": predicted.get("tool"),
+                "args": copy.deepcopy(predicted.get("args", {})),
+                "timestamp": None,
+                "state_before": None,
+                "synthetic_attempt": True,
+            })
+
+    return grading_history
 
 
 def _run_checker_against_remote_state(
     task_id: str,
     remote_state: dict[str, Any],
+    grading_history: list[dict[str, Any]],
+    *,
+    retry_count: int = 0,
+    recovery_success: bool = False,
+    execution_errors: list[str] | None = None,
 ) -> dict[str, Any]:
-    """
-    Run the existing checker against the REAL sandbox state.
-
-    We do not reimplement checker.py logic here.
-    """
-
     previous_state = _sync_checker_state(
-        remote_state
+        remote_state,
+        grading_history,
+        retry_count=retry_count,
+        recovery_success=recovery_success,
+        execution_errors=execution_errors,
     )
-
     try:
         return check(task_id)
-
     finally:
-        _restore_checker_state(
-            previous_state
-        )
+        _restore_checker_state(previous_state)
 
 
-# ============================================================
-# Prediction validation
-# ============================================================
-
-def _validate_tool_calls(
-    calls: Any,
-    task_id: str,
-) -> list[dict[str, Any]]:
-    """
-    Validate the JSON representation of Qwen's predicted calls.
-
-    Expected:
-
-    [
-        {
-            "tool": "check_disk",
-            "args": {}
-        },
-        {
-            "tool": "clear_cache",
-            "args": {}
-        }
-    ]
-    """
-
+def _validate_tool_calls(calls: Any, task_id: str) -> list[dict[str, Any]]:
     if not isinstance(calls, list):
-        raise ValueError(
-            f"Predictions for '{task_id}' must be a list."
-        )
+        raise ValueError(f"Predictions for '{task_id}' must be a list.")
 
     validated = []
-
     for index, call in enumerate(calls):
-
         if not isinstance(call, dict):
-            raise ValueError(
-                f"Invalid call at index {index} "
-                f"for task '{task_id}': {call!r}"
-            )
-
+            raise ValueError(f"Invalid call at index {index} for '{task_id}': {call!r}")
         tool = call.get("tool")
-
-        args = call.get(
-            "args",
-            {},
-        )
-
+        args = call.get("args", {})
         if not isinstance(tool, str):
-            raise ValueError(
-                f"Invalid tool at index {index} "
-                f"for task '{task_id}'."
-            )
-
+            raise ValueError(f"Invalid tool at index {index} for '{task_id}'.")
         if not isinstance(args, dict):
-            raise ValueError(
-                f"Args must be an object for "
-                f"'{tool}' in task '{task_id}'."
-            )
-
-        validated.append(
-            {
-                "tool": tool,
-                "args": args,
-            }
-        )
-
+            raise ValueError(f"Args must be an object for '{tool}' in '{task_id}'.")
+        validated.append({"tool": tool, "args": args})
     return validated
 
 
-def load_predictions(
-    path: str,
-) -> dict[str, list[dict[str, Any]]]:
-    """
-    Load Qwen predictions.
-
-    Expected format:
-
-    {
-        "task_id_001": [
-            {
-                "tool": "check_disk",
-                "args": {}
-            }
-        ],
-
-        "task_id_002": [
-            {
-                "tool": "get_metrics",
-                "args": {
-                    "service": "api"
-                }
-            }
-        ]
-    }
-    """
-
+def load_predictions(path: str) -> dict[str, list[dict[str, Any]]]:
     prediction_path = Path(path)
-
     if not prediction_path.exists():
-        raise FileNotFoundError(
-            f"Prediction file not found: {prediction_path}"
-        )
-
-    with prediction_path.open(
-        "r",
-        encoding="utf-8",
-    ) as file:
-        predictions = json.load(file)
-
-    if not isinstance(predictions, dict):
-        raise ValueError(
-            "Prediction JSON must be an object "
-            "keyed by task_id."
-        )
-
-    validated = {}
-
-    for task_id, calls in predictions.items():
-
-        validated[task_id] = _validate_tool_calls(
-            calls,
-            task_id,
-        )
-
-    return validated
+        raise FileNotFoundError(f"Prediction file not found: {prediction_path}")
+    data = json.loads(prediction_path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("Prediction JSON must be an object keyed by task_id.")
+    return {task_id: _validate_tool_calls(calls, task_id) for task_id, calls in data.items()}
 
 
-# ============================================================
-# Tool / Argument Metrics
-# ============================================================
+def load_traces(path: str | None) -> dict[str, dict[str, Any]]:
+    if not path:
+        return {}
+    trace_path = Path(path)
+    if not trace_path.exists():
+        raise FileNotFoundError(f"Trace file not found: {trace_path}")
+    data = json.loads(trace_path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("Trace JSON must be an object keyed by task_id.")
+    return data
 
-def _tool_and_argument_metrics(
-    predicted_calls: list[dict[str, Any]],
-    gold_actions: list[dict[str, Any]],
-) -> dict[str, Any]:
+
+def _trace_calls(trace_entry: dict[str, Any] | None, fallback: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not isinstance(trace_entry, dict):
+        return fallback
+
+    events = trace_entry.get("events")
+    if isinstance(events, list):
+        calls = [
+            {"tool": e.get("tool"), "args": e.get("args", {})}
+            for e in events
+            if isinstance(e, dict) and e.get("type") == "tool_call"
+        ]
+        if calls:
+            return _validate_tool_calls(calls, str(trace_entry.get("task_id", "trace")))
+
+    parsed = trace_entry.get("parsed_tool_calls")
+    if isinstance(parsed, list):
+        return _validate_tool_calls(parsed, str(trace_entry.get("task_id", "trace")))
+
+    return fallback
+
+
+def _trace_recovery(trace_entry: dict[str, Any] | None) -> dict[str, Any]:
+    """Extract retry/recovery only when the trace contains interaction events.
+
+    The current one-shot Qwen traces do not contain tool-result events, so their
+    retry_count is correctly reported as zero rather than being fabricated.
     """
-    Calculate tool-selection and argument accuracy.
+    if not isinstance(trace_entry, dict):
+        return {"retry_count": 0, "recovery_success": False, "retry_supported": False}
 
-    We compare the first N predicted calls against the first N
-    gold actions.
+    events = trace_entry.get("events")
+    if not isinstance(events, list):
+        return {"retry_count": 0, "recovery_success": False, "retry_supported": False}
 
-    This keeps the metric interpretable at the step level.
+    retry_count = 0
+    recovery_count = 0
+    pending_error = False
 
-    Extra predicted calls are counted as incorrect selections
-    rather than ignored.
-    """
-
-    gold_count = len(gold_actions)
-    predicted_count = len(predicted_calls)
-
-    if gold_count == 0:
-
-        return {
-            "tool_selection_correct": 0,
-            "tool_selection_total": predicted_count,
-            "tool_selection_accuracy": (
-                100.0
-                if predicted_count == 0
-                else 0.0
-            ),
-
-            "argument_correct": 0,
-            "argument_total": predicted_count,
-            "argument_accuracy": (
-                100.0
-                if predicted_count == 0
-                else 0.0
-            ),
-        }
-
-    comparison_count = max(
-        gold_count,
-        predicted_count,
-    )
-
-    tool_correct = 0
-    argument_correct = 0
-
-    for index in range(comparison_count):
-
-        predicted = (
-            predicted_calls[index]
-            if index < predicted_count
-            else None
-        )
-
-        gold = (
-            gold_actions[index]
-            if index < gold_count
-            else None
-        )
-
-        if predicted is None:
+    for event in events:
+        if not isinstance(event, dict):
             continue
+        event_type = event.get("type")
+        if event_type == "tool_result" and not event.get("ok", True):
+            pending_error = True
+        elif event_type == "tool_call" and pending_error:
+            retry_count += 1
+            pending_error = False
+        elif event_type == "tool_result" and event.get("ok", True) and pending_error:
+            recovery_count += 1
+            pending_error = False
 
-        if gold is None:
-            # Extra model action.
-            continue
-
-        predicted_tool = predicted.get("tool")
-        gold_tool = gold.get("tool")
-
-        predicted_args = predicted.get(
-            "args",
-            {},
-        )
-
-        gold_args = gold.get(
-            "args",
-            {},
-        )
-
-        if predicted_tool == gold_tool:
-            tool_correct += 1
-
-            if predicted_args == gold_args:
-                argument_correct += 1
-
-    tool_total = comparison_count
-    argument_total = comparison_count
-
+    # Treat an eventual successful final state as recovery; evaluate_task can
+    # refine this after grading.
     return {
-        "tool_selection_correct": tool_correct,
-        "tool_selection_total": tool_total,
-        "tool_selection_accuracy": (
-            round(
-                100.0 * tool_correct / tool_total,
-                2,
-            )
-            if tool_total
-            else 0.0
-        ),
-
-        "argument_correct": argument_correct,
-        "argument_total": argument_total,
-        "argument_accuracy": (
-            round(
-                100.0 * argument_correct / argument_total,
-                2,
-            )
-            if argument_total
-            else 0.0
-        ),
+        "retry_count": retry_count,
+        "recovery_success": False,
+        "retry_supported": True,
+        "recovery_count": recovery_count,
     }
 
 
-# ============================================================
-# Action Order Correctness + Precision / Recall
-# ============================================================
-
-def _longest_common_subsequence_len(
-    a: list[str],
-    b: list[str],
-) -> int:
-    """
-    Standard LCS length over two sequences of tool names.
-
-    Used to score how well the predicted call *order* matches the
-    gold order, independent of extra/missing calls.
-    """
-
-    n, m = len(a), len(b)
-
-    if n == 0 or m == 0:
-        return 0
-
-    dp = [[0] * (m + 1) for _ in range(n + 1)]
-
-    for i in range(1, n + 1):
-        for j in range(1, m + 1):
-            if a[i - 1] == b[j - 1]:
-                dp[i][j] = dp[i - 1][j - 1] + 1
-            else:
-                dp[i][j] = max(dp[i - 1][j], dp[i][j - 1])
-
-    return dp[n][m]
-
-
-def _order_and_set_metrics(
-    predicted_calls: list[dict[str, Any]],
-    gold_actions: list[dict[str, Any]],
-) -> dict[str, Any]:
-    """
-    Action Order Correctness:
-        - order_exact_match: True if predicted tool-name sequence is
-          identical, position by position, to the gold sequence.
-        - order_score: LCS(predicted, gold) / len(gold), a partial-credit
-          measure that tolerates extra/missing calls elsewhere in the
-          sequence while still rewarding correct relative ordering.
-
-    Precision / Recall (multiset over tool names, order-independent):
-        - precision: of the tools the model called, how many were
-          actually required (accounting for repeats).
-        - recall: of the tools required, how many did the model call.
-    """
-
+def _tool_and_argument_metrics(predicted_calls: list[dict[str, Any]], gold_actions: list[dict[str, Any]]) -> dict[str, Any]:
     predicted_tools = [c.get("tool") for c in predicted_calls]
     gold_tools = [g.get("tool") for g in gold_actions]
 
-    order_exact_match = predicted_tools == gold_tools
+    tool_exact = predicted_tools == gold_tools
 
-    lcs_len = _longest_common_subsequence_len(predicted_tools, gold_tools)
-
-    order_score = (
-        round(100.0 * lcs_len / len(gold_tools), 2)
-        if gold_tools
-        else (100.0 if not predicted_tools else 0.0)
-    )
-
-    # Multiset precision/recall on tool names.
     remaining_gold = list(gold_tools)
     true_positives = 0
-
     for tool in predicted_tools:
         if tool in remaining_gold:
             remaining_gold.remove(tool)
             true_positives += 1
 
-    precision = (
-        round(100.0 * true_positives / len(predicted_tools), 2)
-        if predicted_tools
-        else (100.0 if not gold_tools else 0.0)
+    precision = true_positives / len(predicted_tools) if predicted_tools else (1.0 if not gold_tools else 0.0)
+    recall = true_positives / len(gold_tools) if gold_tools else (1.0 if not predicted_tools else 0.0)
+    f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+
+    position_count = max(len(predicted_calls), len(gold_actions))
+    position_tool_correct = sum(
+        1
+        for actual, expected in zip(predicted_calls, gold_actions)
+        if actual.get("tool") == expected.get("tool")
     )
 
-    recall = (
-        round(100.0 * true_positives / len(gold_tools), 2)
-        if gold_tools
-        else (100.0 if not predicted_tools else 0.0)
-    )
+    argument_comparable = 0
+    argument_exact = 0
+    key_tp = key_pred = key_gold = 0
+
+    for actual, expected in zip(predicted_calls, gold_actions):
+        if actual.get("tool") != expected.get("tool"):
+            continue
+        argument_comparable += 1
+        actual_args = actual.get("args", {}) or {}
+        expected_args = expected.get("args", {}) or {}
+        if actual_args == expected_args:
+            argument_exact += 1
+        actual_keys = set(actual_args)
+        expected_keys = set(expected_args)
+        key_tp += len(actual_keys & expected_keys)
+        key_pred += len(actual_keys)
+        key_gold += len(expected_keys)
+
+    key_precision = key_tp / key_pred if key_pred else (1.0 if key_gold == 0 else 0.0)
+    key_recall = key_tp / key_gold if key_gold else (1.0 if key_pred == 0 else 0.0)
+    key_f1 = 2 * key_precision * key_recall / (key_precision + key_recall) if key_precision + key_recall else 0.0
 
     return {
-        "order_exact_match": order_exact_match,
-        "order_score": order_score,
-        "precision": precision,
-        "recall": recall,
+        "tool_exact_match": tool_exact,
+        "tool_precision": round(100 * precision, 2),
+        "tool_recall": round(100 * recall, 2),
+        "tool_f1": round(100 * f1, 2),
+        "tool_selection_correct": position_tool_correct,
+        "tool_selection_total": position_count,
+        "tool_selection_accuracy": round(100 * position_tool_correct / position_count, 2) if position_count else 0.0,
+        "argument_exact_count": argument_exact,
+        "argument_comparable_calls": argument_comparable,
+        "argument_exact_match": round(100 * argument_exact / argument_comparable, 2) if argument_comparable else 0.0,
+        "argument_key_precision": round(100 * key_precision, 2),
+        "argument_key_recall": round(100 * key_recall, 2),
+        "argument_key_f1": round(100 * key_f1, 2),
+        "argument_correct": argument_exact,
+        "argument_total": argument_comparable,
+        "argument_accuracy": round(100 * argument_exact / argument_comparable, 2) if argument_comparable else 0.0,
     }
 
 
-# ============================================================
-# Single Task Evaluation
-# ============================================================
+def _lcs_len(a: list[str], b: list[str]) -> int:
+    if not a or not b:
+        return 0
+    dp = [[0] * (len(b) + 1) for _ in range(len(a) + 1)]
+    for i in range(1, len(a) + 1):
+        for j in range(1, len(b) + 1):
+            dp[i][j] = dp[i - 1][j - 1] + 1 if a[i - 1] == b[j - 1] else max(dp[i - 1][j], dp[i][j - 1])
+    return dp[-1][-1]
+
+
+def _order_and_set_metrics(predicted_calls: list[dict[str, Any]], gold_actions: list[dict[str, Any]]) -> dict[str, Any]:
+    predicted_tools = [c.get("tool") for c in predicted_calls]
+    gold_tools = [g.get("tool") for g in gold_actions]
+    exact = predicted_tools == gold_tools
+    lcs = _lcs_len(predicted_tools, gold_tools)
+    order_score = 100 * lcs / len(gold_tools) if gold_tools else (100.0 if not predicted_tools else 0.0)
+
+    remaining = list(gold_tools)
+    tp = 0
+    for tool in predicted_tools:
+        if tool in remaining:
+            remaining.remove(tool)
+            tp += 1
+    precision = tp / len(predicted_tools) if predicted_tools else (1.0 if not gold_tools else 0.0)
+    recall = tp / len(gold_tools) if gold_tools else (1.0 if not predicted_tools else 0.0)
+
+    return {
+        "order_exact_match": exact,
+        "order_score": round(order_score, 2),
+        "precision": round(100 * precision, 2),
+        "recall": round(100 * recall, 2),
+    }
+
 
 def evaluate_task(
     session: requests.Session,
@@ -811,138 +476,52 @@ def evaluate_task(
     language: str,
     base_url: str = BASE_URL,
     timeout: float = DEFAULT_TIMEOUT,
+    trace_entry: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """
-    Evaluate ONE task.
-
-    Pipeline:
-
-        reset
-          ↓
-        Qwen predicted calls
-          ↓
-        actual HTTP execution
-          ↓
-        collect history/state
-          ↓
-        checker
-          ↓
-        metrics
-    """
-
-    if task_id not in TASKS_BY_ID:
-        raise EvaluatorError(
-            f"Unknown task_id '{task_id}'."
-        )
-
     task = get_task(task_id)
+    effective_calls = _trace_calls(trace_entry, predicted_calls)
+    recovery = _trace_recovery(trace_entry)
 
     result: dict[str, Any] = {
         "task_id": task_id,
         "language": language,
-
-        "domain": task.get(
-            "domain",
-            "",
-        ),
-
-        "difficulty": task.get(
-            "difficulty",
-            "",
-        ),
-
-        "passed": False,
-
-        "gold_actions_correct": False,
-        "state_match": False,
-
-        "conditional_violations": [],
-
-        "forbidden_action": False,
-        "risky_action": False,
-        "unexpected_action": False,
-
-        "forbidden_calls": [],
-        "risky_calls": [],
-        "unexpected_calls": [],
-
-        "predicted_calls": predicted_calls,
+        "domain": task.get("domain", ""),
+        "difficulty": str(task.get("difficulty", "")).strip().lower(),
+        "predicted_calls": effective_calls,
         "executed_calls": [],
-
         "history": [],
         "final_state": {},
-
         "execution_errors": [],
-
         "tool_selection_correct": 0,
         "tool_selection_total": 0,
         "tool_selection_accuracy": 0.0,
-
         "argument_correct": 0,
         "argument_total": 0,
         "argument_accuracy": 0.0,
-
         "order_exact_match": False,
         "order_score": 0.0,
-
         "precision": 0.0,
         "recall": 0.0,
+        "retry_count": recovery["retry_count"],
+        "recovery_success": False,
+        "retry_supported": recovery["retry_supported"],
     }
 
-    # --------------------------------------------------------
-    # 1. Reset
-    # --------------------------------------------------------
+    start_total = time.perf_counter()
 
     try:
-        reset_task_http(
-            session=session,
-            task_id=task_id,
-            base_url=base_url,
-            timeout=timeout,
-        )
-
+        reset_task_http(session, task_id, base_url, timeout)
     except Exception as exc:
-        result["execution_errors"].append(
-            f"Reset error: {exc}"
-        )
-
+        result["execution_errors"].append(f"Reset error: {exc}")
+        result["total_execution_ms"] = round((time.perf_counter() - start_total) * 1000, 3)
         return result
 
-    # --------------------------------------------------------
-    # 2. Tool / argument metrics
-    # --------------------------------------------------------
+    metric_result = _tool_and_argument_metrics(effective_calls, task.get("gold_actions", []))
+    order_result = _order_and_set_metrics(effective_calls, task.get("gold_actions", []))
+    result.update(metric_result)
+    result.update(order_result)
 
-    gold_actions = task.get(
-        "gold_actions",
-        [],
-    )
-
-    metric_result = _tool_and_argument_metrics(
-        predicted_calls=predicted_calls,
-        gold_actions=gold_actions,
-    )
-
-    result.update(
-        metric_result
-    )
-
-    order_result = _order_and_set_metrics(
-        predicted_calls=predicted_calls,
-        gold_actions=gold_actions,
-    )
-
-    result.update(
-        order_result
-    )
-
-    # --------------------------------------------------------
-    # 3. Execute Qwen's calls
-    # --------------------------------------------------------
-
-    for index, call in enumerate(
-        predicted_calls
-    ):
-
+    for index, call in enumerate(effective_calls):
         try:
             execution = call_tool(
                 session=session,
@@ -951,129 +530,79 @@ def evaluate_task(
                 base_url=base_url,
                 timeout=timeout,
             )
-
-            result["executed_calls"].append(
-                execution
-            )
-
+            execution["index"] = index
+            result["executed_calls"].append(execution)
         except EvaluatorError as exc:
-
-            result["execution_errors"].append(
-                f"Call {index}: {exc}"
-            )
-
-            # Server-level failure.
-            # Do not continue trying to reach a dead server.
+            result["execution_errors"].append(f"Call {index}: {exc}")
             break
-
         except Exception as exc:
-
-            result["execution_errors"].append(
-                f"Call {index}: {type(exc).__name__}: {exc}"
-            )
-
-    # --------------------------------------------------------
-    # 4. Collect actual state + history
-    # --------------------------------------------------------
+            result["execution_errors"].append(f"Call {index}: {type(exc).__name__}: {exc}")
 
     try:
-
-        remote_history = get_history_http(
-            session=session,
-            base_url=base_url,
-            timeout=timeout,
-        )
-
-        remote_state = get_state_http(
-            session=session,
-            base_url=base_url,
-            timeout=timeout,
-        )
-
-        result["history"] = _sanitize(
-            remote_history
-        )
-
-        result["final_state"] = _sanitize(
-            remote_state
-        )
-
+        remote_history = get_history_http(session, base_url, timeout)
+        remote_state = get_state_http(session, base_url, timeout)
     except Exception as exc:
-
-        result["execution_errors"].append(
-            f"State/history collection error: {exc}"
-        )
-
+        result["execution_errors"].append(f"State/history collection error: {exc}")
+        result["total_execution_ms"] = round((time.perf_counter() - start_total) * 1000, 3)
         return result
 
-    # --------------------------------------------------------
-    # 5. Run canonical checker
-    # --------------------------------------------------------
+    grading_history = _build_grading_history(effective_calls, remote_history)
+    result["history"] = _sanitize(grading_history)
+    result["server_history"] = _sanitize(remote_history)
+    result["final_state"] = _sanitize(remote_state)
 
-    try:
+    graded = _run_checker_against_remote_state(
+        task_id,
+        remote_state,
+        grading_history,
+        retry_count=recovery["retry_count"],
+        recovery_success=False,
+        execution_errors=result["execution_errors"],
+    )
 
-        graded = _run_checker_against_remote_state(
-            task_id=task_id,
-            remote_state=remote_state,
+    result.update({
+        "passed": graded["passed"],
+        "gold_actions_correct": graded["gold_actions_correct"],
+        "state_match": graded["state_match"],
+        "conditional_violations": graded["conditional_violations"],
+        "missing_required_observations": graded["missing_required_observations"],
+        "required_observation_compliance": graded["required_observation_compliance"],
+        "path": graded["path"],
+        "path_exact": graded["path_exact"],
+        "path_valid": graded["path_valid"],
+        "path_suboptimal": graded["path_suboptimal"],
+        "extra_call_count": graded["extra_call_count"],
+        "tool_metrics": graded["tool_metrics"],
+        "argument_metrics": graded["argument_metrics"],
+        "safety": graded["safety"],
+        "forbidden_action": graded["forbidden_action"],
+        "forbidden_calls": graded["forbidden_calls"],
+        "risky_action": graded["risky_action"],
+        "risky_calls": graded["risky_calls"],
+        "unexpected_action": graded["unexpected_action"],
+        "unexpected_calls": graded["unexpected_calls"],
+        "safety_violation": graded["safety_violation"],
+        "outcome": graded["outcome"],
+        "failure_tags": graded["failure_tags"],
+        "called_tools": graded["called_tools"],
+    })
+
+    # Retry/recovery is meaningful only when an interactive trace contains
+    # tool_result events. Current one-shot traces correctly remain at zero.
+    if result["retry_count"] > 0:
+        result["recovery_success"] = bool(
+            result["state_match"]
+            and not result["safety_violation"]
         )
 
-        result["passed"] = graded[
-            "passed"
-        ]
-
-        result["gold_actions_correct"] = graded[
-            "gold_actions_correct"
-        ]
-
-        result["state_match"] = graded[
-            "state_match"
-        ]
-
-        result["conditional_violations"] = graded[
-            "conditional_violations"
-        ]
-
-        safety = graded[
-            "safety"
-        ]
-
-        result["forbidden_action"] = safety[
-            "forbidden_action"
-        ]
-
-        result["forbidden_calls"] = safety[
-            "forbidden_calls"
-        ]
-
-        result["risky_action"] = safety[
-            "risky_action"
-        ]
-
-        result["risky_calls"] = safety[
-            "risky_calls"
-        ]
-
-        result["unexpected_action"] = safety[
-            "unexpected_action"
-        ]
-
-        result["unexpected_calls"] = safety[
-            "unexpected_calls"
-        ]
-
-    except Exception as exc:
-
-        result["execution_errors"].append(
-            f"Checker error: "
-            f"{type(exc).__name__}: {exc}"
-        )
+    result["total_execution_ms"] = round((time.perf_counter() - start_total) * 1000, 3)
+    result["tool_execution_ms"] = round(
+        sum(float(call.get("duration_ms", 0.0)) for call in result["executed_calls"]),
+        3,
+    )
 
     return result
 
-
-# ============================================================
-# Batch evaluation
-# ============================================================
 
 def evaluate_tasks(
     predictions: dict[str, list[dict[str, Any]]],
@@ -1081,384 +610,148 @@ def evaluate_tasks(
     base_url: str = BASE_URL,
     timeout: float = DEFAULT_TIMEOUT,
     selected_task_ids: list[str] | None = None,
+    traces: dict[str, dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
-    """
-    Evaluate multiple tasks.
-
-    Every task is independently reset.
-    """
-
-    if selected_task_ids is None:
-        task_ids = list(
-            predictions.keys()
-        )
-
-    else:
-        task_ids = selected_task_ids
-
+    task_ids = selected_task_ids if selected_task_ids is not None else list(predictions.keys())
     results = []
 
     with requests.Session() as session:
-
-        for index, task_id in enumerate(
-            task_ids,
-            start=1,
-        ):
-
-            print(
-                f"[{index}/{len(task_ids)}] "
-                f"Evaluating {task_id} "
-                f"({language})..."
-            )
-
-            predicted_calls = predictions.get(
-                task_id,
-                [],
-            )
-
+        for index, task_id in enumerate(task_ids, start=1):
+            print(f"[{index}/{len(task_ids)}] Evaluating {task_id} ({language})...")
             try:
-
                 result = evaluate_task(
                     session=session,
                     task_id=task_id,
-                    predicted_calls=predicted_calls,
+                    predicted_calls=predictions.get(task_id, []),
                     language=language,
                     base_url=base_url,
                     timeout=timeout,
+                    trace_entry=(traces or {}).get(task_id),
                 )
-
             except Exception as exc:
-
                 result = {
                     "task_id": task_id,
                     "language": language,
                     "passed": False,
-                    "execution_errors": [
-                        f"{type(exc).__name__}: {exc}"
-                    ],
+                    "outcome": "execution_error",
+                    "execution_errors": [f"{type(exc).__name__}: {exc}"],
                 }
-
-            results.append(
-                result
-            )
+            results.append(result)
 
     return results
 
 
-# ============================================================
-# Aggregate metrics
-# ============================================================
-
-def _percentage(
-    numerator: int,
-    denominator: int,
-) -> float:
-    if denominator == 0:
-        return 0.0
-
-    return round(
-        100.0 * numerator / denominator,
-        2,
-    )
+def _percentage(numerator: int, denominator: int) -> float:
+    return round(100 * numerator / denominator, 2) if denominator else 0.0
 
 
-def summarize(
-    results: list[dict[str, Any]],
-) -> dict[str, Any]:
-    """
-    Aggregate evaluation metrics.
-
-    Metrics:
-
-    SR  = Task Success Rate
-    SMR = State Match Rate
-    TSA = Tool Selection Accuracy
-    ArgA = Argument Accuracy
-
-    Also reports safety violations and execution errors.
-    """
-
+def summarize(results: list[dict[str, Any]]) -> dict[str, Any]:
     total = len(results)
 
-    passed = sum(
-        1
-        for result in results
-        if result.get("passed", False)
-    )
+    outcomes = {}
+    for result in results:
+        outcome = result.get("outcome", "unknown")
+        outcomes[outcome] = outcomes.get(outcome, 0) + 1
 
-    state_correct = sum(
-        1
-        for result in results
-        if result.get(
-            "state_match",
-            False,
-        )
-    )
+    passed = sum(result.get("outcome") == "full_success" for result in results)
+    state_correct = sum(bool(result.get("state_match")) for result in results)
+    tool_correct = sum(result.get("tool_selection_correct", 0) for result in results)
+    tool_total = sum(result.get("tool_selection_total", 0) for result in results)
+    argument_correct = sum(result.get("argument_correct", 0) for result in results)
+    argument_total = sum(result.get("argument_total", 0) for result in results)
 
-    forbidden = sum(
-        1
-        for result in results
-        if result.get(
-            "forbidden_action",
-            False,
-        )
-    )
+    forbidden = sum(bool(result.get("forbidden_action")) for result in results)
+    risky = sum(bool(result.get("risky_action")) for result in results)
+    unexpected = sum(bool(result.get("unexpected_action")) for result in results)
+    safety_violations = sum(bool(result.get("safety_violation")) for result in results)
+    observation_compliant = sum(bool(result.get("required_observation_compliance")) for result in results)
+    observation_total = sum(1 for result in results if result.get("required_observation_compliance") is not None)
 
-    risky = sum(
-        1
-        for result in results
-        if result.get(
-            "risky_action",
-            False,
-        )
-    )
+    retry_tasks = sum(result.get("retry_count", 0) > 0 for result in results)
+    recovered = sum(bool(result.get("recovery_success")) for result in results)
 
-    unexpected = sum(
-        1
-        for result in results
-        if result.get(
-            "unexpected_action",
-            False,
-        )
-    )
+    order_exact = sum(bool(result.get("order_exact_match")) for result in results)
+    order_scores = [float(result.get("order_score", 0.0)) for result in results]
+    precisions = [float(result.get("precision", 0.0)) for result in results]
+    recalls = [float(result.get("recall", 0.0)) for result in results]
 
-    execution_errors = sum(
-        1
-        for result in results
-        if result.get(
-            "execution_errors"
-        )
-    )
+    total_execution_ms = sum(float(result.get("total_execution_ms", 0.0)) for result in results)
+    tool_execution_ms = sum(float(result.get("tool_execution_ms", 0.0)) for result in results)
+    extra_calls = sum(int(result.get("extra_call_count", 0)) for result in results)
 
-    tool_correct = sum(
-        result.get(
-            "tool_selection_correct",
-            0,
-        )
-        for result in results
-    )
-
-    tool_total = sum(
-        result.get(
-            "tool_selection_total",
-            0,
-        )
-        for result in results
-    )
-
-    argument_correct = sum(
-        result.get(
-            "argument_correct",
-            0,
-        )
-        for result in results
-    )
-
-    argument_total = sum(
-        result.get(
-            "argument_total",
-            0,
-        )
-        for result in results
-    )
-
-    # Safety Violation Rate: a task counts as a violation if it triggered
-    # ANY forbidden, risky, or unexpected action.
-    safety_violations = sum(
-        1
-        for result in results
-        if result.get("forbidden_action", False)
-        or result.get("risky_action", False)
-        or result.get("unexpected_action", False)
-    )
-
-    order_exact_matches = sum(
-        1
-        for result in results
-        if result.get("order_exact_match", False)
-    )
-
-    order_score_sum = sum(
-        result.get("order_score", 0.0)
-        for result in results
-    )
-
-    precision_sum = sum(
-        result.get("precision", 0.0)
-        for result in results
-    )
-
-    recall_sum = sum(
-        result.get("recall", 0.0)
-        for result in results
-    )
+    failure_counts: dict[str, int] = {}
+    for result in results:
+        for tag in result.get("failure_tags", []):
+            failure_counts[tag] = failure_counts.get(tag, 0) + 1
 
     return {
         "total_tasks": total,
-
         "passed_tasks": passed,
-
-        "failed_tasks": (
-            total - passed
-        ),
-
-        "task_success_rate": _percentage(
-            passed,
-            total,
-        ),
-
-        "state_match_rate": _percentage(
-            state_correct,
-            total,
-        ),
-
-        "tool_selection_accuracy": _percentage(
-            tool_correct,
-            tool_total,
-        ),
-
-        "argument_accuracy": _percentage(
-            argument_correct,
-            argument_total,
-        ),
-
+        "failed_tasks": total - passed,
+        "task_success_rate": _percentage(passed, total),
+        "state_match_rate": _percentage(state_correct, total),
+        "tool_selection_accuracy": _percentage(tool_correct, tool_total),
+        "argument_accuracy": _percentage(argument_correct, argument_total),
         "tool_selection_correct": tool_correct,
         "tool_selection_total": tool_total,
-
         "argument_correct": argument_correct,
         "argument_total": argument_total,
-
+        "tool_exact_match_rate": _percentage(sum(bool(r.get("tool_metrics", {}).get("tool_exact_match")) for r in results), total),
+        "avg_tool_precision": round(sum(float(r.get("tool_metrics", {}).get("tool_precision", 0.0)) for r in results) / total, 2) if total else 0.0,
+        "avg_tool_recall": round(sum(float(r.get("tool_metrics", {}).get("tool_recall", 0.0)) for r in results) / total, 2) if total else 0.0,
+        "avg_tool_f1": round(sum(float(r.get("tool_metrics", {}).get("tool_f1", 0.0)) for r in results) / total, 2) if total else 0.0,
+        "avg_argument_key_f1": round(sum(float(r.get("argument_metrics", {}).get("argument_key_f1", 0.0)) for r in results) / total, 2) if total else 0.0,
+        "order_exact_match_tasks": order_exact,
+        "order_exact_match_rate": _percentage(order_exact, total),
+        "avg_order_score": round(sum(order_scores) / total, 2) if total else 0.0,
+        "avg_precision": round(sum(precisions) / total, 2) if total else 0.0,
+        "avg_recall": round(sum(recalls) / total, 2) if total else 0.0,
         "forbidden_tasks": forbidden,
         "risky_tasks": risky,
         "unexpected_tasks": unexpected,
-
         "safety_violation_tasks": safety_violations,
-        "safety_violation_rate": _percentage(
-            safety_violations,
-            total,
-        ),
-
-        "order_exact_match_tasks": order_exact_matches,
-        "order_exact_match_rate": _percentage(
-            order_exact_matches,
-            total,
-        ),
-        "avg_order_score": (
-            round(order_score_sum / total, 2)
-            if total
-            else 0.0
-        ),
-
-        "avg_precision": (
-            round(precision_sum / total, 2)
-            if total
-            else 0.0
-        ),
-        "avg_recall": (
-            round(recall_sum / total, 2)
-            if total
-            else 0.0
-        ),
-
-        "execution_error_tasks": execution_errors,
+        "safety_violation_rate": _percentage(safety_violations, total),
+        "required_observation_compliance_rate": _percentage(observation_compliant, observation_total),
+        "avg_extra_calls": round(extra_calls / total, 2) if total else 0.0,
+        "retry_tasks": retry_tasks,
+        "retry_rate": _percentage(retry_tasks, total),
+        "recovery_success_tasks": recovered,
+        "recovery_success_rate": _percentage(recovered, retry_tasks),
+        "avg_total_execution_ms": round(total_execution_ms / total, 3) if total else 0.0,
+        "avg_tool_execution_ms": round(tool_execution_ms / total, 3) if total else 0.0,
+        "outcomes": outcomes,
+        "failure_counts": dict(sorted(failure_counts.items())),
+        "execution_error_tasks": sum(bool(r.get("execution_errors")) for r in results),
+        "dangerous_success_tasks": sum(r.get("outcome") == "dangerous_success" for r in results),
+        "dangerous_failure_tasks": sum(r.get("outcome") == "dangerous_failure" for r in results),
+        "partial_failure_tasks": sum(r.get("outcome") == "partial_failure" for r in results),
+        "safe_failure_tasks": sum(r.get("outcome") == "safe_failure" for r in results),
+        "successful_non_optimal_tasks": sum(r.get("outcome") == "successful_non_optimal" for r in results),
     }
 
 
-def summarize_by_language(
-    results: list[dict[str, Any]],
-) -> dict[str, dict[str, Any]]:
-    """
-    Produce metrics grouped by language.
-
-    Useful when running:
-
-        predictions_en.json
-        predictions_msa.json
-        predictions_gulf.json
-        predictions_mixed.json
-    """
-
-    summary = {}
-
-    for language in LANGUAGES:
-
-        language_results = [
-            result
-            for result in results
-            if result.get(
-                "language"
-            ) == language
-        ]
-
-        if not language_results:
-            continue
-
-        summary[language] = summarize(
-            language_results
-        )
-
-    return summary
-
-
-DIFFICULTIES = ("easy", "medium", "hard")
-
-
-def summarize_by_difficulty(
-    results: list[dict[str, Any]],
-) -> dict[str, dict[str, Any]]:
-    """
-    Produce metrics grouped by task difficulty (easy / medium / hard).
-    """
-
-    summary = {}
-
-    for difficulty in DIFFICULTIES:
-
-        difficulty_results = [
-            result
-            for result in results
-            if result.get("difficulty") == difficulty
-        ]
-
-        if not difficulty_results:
-            continue
-
-        summary[difficulty] = summarize(
-            difficulty_results
-        )
-
-    return summary
-
-
-def cross_language_gap(
-    by_language_summary: dict[str, dict[str, Any]],
-    metric: str = "task_success_rate",
-) -> dict[str, Any]:
-    """
-    Cross-Language Performance Gap (Delta).
-
-    Reports, for the given metric (default: Task Success Rate), the
-    max-vs-min gap across languages plus the per-language values used
-    to compute it.
-    """
-
-    values = {
-        language: lang_summary.get(metric, 0.0)
-        for language, lang_summary in by_language_summary.items()
+def summarize_by_language(results: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    return {
+        language: summarize([r for r in results if r.get("language") == language])
+        for language in LANGUAGES
+        if any(r.get("language") == language for r in results)
     }
 
+
+def summarize_by_difficulty(results: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    difficulties = sorted({str(r.get("difficulty", "unknown")).lower() for r in results})
+    return {
+        difficulty: summarize([r for r in results if str(r.get("difficulty", "unknown")).lower() == difficulty])
+        for difficulty in difficulties
+    }
+
+
+def cross_language_gap(by_language_summary: dict[str, dict[str, Any]], metric: str = "task_success_rate") -> dict[str, Any]:
+    values = {lang: summary.get(metric, 0.0) for lang, summary in by_language_summary.items()}
     if not values:
-        return {
-            "metric": metric,
-            "values": {},
-            "max_language": None,
-            "min_language": None,
-            "gap": 0.0,
-        }
-
+        return {"metric": metric, "values": {}, "max_language": None, "min_language": None, "gap": 0.0}
     max_language = max(values, key=values.get)
     min_language = min(values, key=values.get)
-
     return {
         "metric": metric,
         "values": values,
@@ -1468,417 +761,105 @@ def cross_language_gap(
     }
 
 
-# ============================================================
-# Save results
-# ============================================================
+def save_results(results: list[dict[str, Any]], output_dir: str | Path = RESULTS_DIR) -> tuple[Path, Path]:
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-def save_results(
-    results: list[dict[str, Any]],
-    output_dir: str | Path = RESULTS_DIR,
-) -> tuple[Path, Path]:
-    """
-    Save detailed results and aggregate summary.
-    """
+    detailed_path = output_dir / "evaluation_results.json"
+    summary_path = output_dir / "evaluation_summary.json"
 
-    output_dir = Path(
-        output_dir
-    )
+    summary = summarize(results)
+    summary["by_language"] = summarize_by_language(results)
+    summary["by_difficulty"] = summarize_by_difficulty(results)
+    summary["cross_language_gap"] = cross_language_gap(summary["by_language"])
 
-    output_dir.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    detailed_path = (
-        output_dir
-        / "evaluation_results.json"
-    )
-
-    summary_path = (
-        output_dir
-        / "evaluation_summary.json"
-    )
-
-    sanitized_results = [
-        _sanitize(result)
-        for result in results
-    ]
-
-    summary = summarize(
-        results
-    )
-
-    summary["by_language"] = (
-        summarize_by_language(
-            results
-        )
-    )
-
-    summary["by_difficulty"] = (
-        summarize_by_difficulty(
-            results
-        )
-    )
-
-    summary["cross_language_gap"] = cross_language_gap(
-        summary["by_language"]
-    )
-
-    with detailed_path.open(
-        "w",
+    detailed_path.write_text(
+        json.dumps([_sanitize(r) for r in results], ensure_ascii=False, indent=2),
         encoding="utf-8",
-    ) as file:
-
-        json.dump(
-            sanitized_results,
-            file,
-            ensure_ascii=False,
-            indent=2,
-        )
-
-    with summary_path.open(
-        "w",
+    )
+    summary_path.write_text(
+        json.dumps(summary, ensure_ascii=False, indent=2),
         encoding="utf-8",
-    ) as file:
-
-        json.dump(
-            summary,
-            file,
-            ensure_ascii=False,
-            indent=2,
-        )
-
-    return (
-        detailed_path,
-        summary_path,
     )
+    return detailed_path, summary_path
 
 
-# ============================================================
-# Console summary
-# ============================================================
+def print_summary(results: list[dict[str, Any]]) -> None:
+    summary = summarize(results)
 
-def print_summary(
-    results: list[dict[str, Any]],
-) -> None:
-
-    summary = summarize(
-        results
-    )
-
-    print()
-    print("=" * 70)
+    print("\n" + "=" * 78)
     print("OpsMix-Ar Evaluation")
-    print("=" * 70)
+    print("=" * 78)
+    print(f"Total tasks:                    {summary['total_tasks']}")
+    print(f"Full success:                   {summary['passed_tasks']}")
+    print(f"Task Success Rate:              {summary['task_success_rate']:.2f}%")
+    print(f"Final State Match:              {summary['state_match_rate']:.2f}%")
+    print(f"Tool Exact Match:               {summary['tool_exact_match_rate']:.2f}%")
+    print(f"Tool Selection Accuracy:        {summary['tool_selection_accuracy']:.2f}%")
+    print(f"Argument Exact Accuracy:        {summary['argument_accuracy']:.2f}%")
+    print(f"Argument Key F1:                {summary['avg_argument_key_f1']:.2f}%")
+    print(f"Order Exact Match:              {summary['order_exact_match_rate']:.2f}%")
+    print(f"Avg Order Score:                {summary['avg_order_score']:.2f}%")
+    print(f"Safety Violation Rate:          {summary['safety_violation_rate']:.2f}%")
+    print(f"Dangerous Success:              {summary['dangerous_success_tasks']}")
+    print(f"Dangerous Failure:              {summary['dangerous_failure_tasks']}")
+    print(f"Safe Failure:                   {summary['safe_failure_tasks']}")
+    print(f"Partial Failure:                {summary['partial_failure_tasks']}")
+    print(f"Successful but Non-Optimal:     {summary['successful_non_optimal_tasks']}")
+    print(f"Required-Observation Compliance:{summary['required_observation_compliance_rate']:.2f}%")
+    print(f"Avg Extra Calls:                {summary['avg_extra_calls']:.2f}")
+    print(f"Retry Rate:                     {summary['retry_rate']:.2f}%")
+    print(f"Recovery Success Rate:          {summary['recovery_success_rate']:.2f}%")
+    print(f"Avg Total Execution:            {summary['avg_total_execution_ms']:.3f} ms")
+    print(f"Avg Tool Execution:             {summary['avg_tool_execution_ms']:.3f} ms")
+    print("=" * 78)
 
-    print(
-        f"Total tasks:              "
-        f"{summary['total_tasks']}"
-    )
-
-    print(
-        f"Passed:                   "
-        f"{summary['passed_tasks']}"
-    )
-
-    print(
-        f"Failed:                   "
-        f"{summary['failed_tasks']}"
-    )
-
-    print(
-        f"Task Success Rate:        "
-        f"{summary['task_success_rate']:.2f}%"
-    )
-
-    print(
-        f"State Match Rate:         "
-        f"{summary['state_match_rate']:.2f}%"
-    )
-
-    print(
-        f"Tool Selection Accuracy:  "
-        f"{summary['tool_selection_accuracy']:.2f}%"
-    )
-
-    print(
-        f"Argument Accuracy:        "
-        f"{summary['argument_accuracy']:.2f}%"
-    )
-
-    print(
-        f"Order Exact-Match Rate:   "
-        f"{summary['order_exact_match_rate']:.2f}%"
-    )
-
-    print(
-        f"Avg Order Score:          "
-        f"{summary['avg_order_score']:.2f}%"
-    )
-
-    print(
-        f"Avg Precision:            "
-        f"{summary['avg_precision']:.2f}%"
-    )
-
-    print(
-        f"Avg Recall:               "
-        f"{summary['avg_recall']:.2f}%"
-    )
-
-    print(
-        f"Safety Violation Rate:    "
-        f"{summary['safety_violation_rate']:.2f}%"
-    )
-
-    print(
-        f"Forbidden tasks:          "
-        f"{summary['forbidden_tasks']}"
-    )
-
-    print(
-        f"Risky tasks:              "
-        f"{summary['risky_tasks']}"
-    )
-
-    print(
-        f"Unexpected-action tasks:  "
-        f"{summary['unexpected_tasks']}"
-    )
-
-    print(
-        f"Execution-error tasks:    "
-        f"{summary['execution_error_tasks']}"
-    )
-
-    print("=" * 70)
-
-    by_difficulty = summarize_by_difficulty(results)
-
-    if by_difficulty:
-        print()
-        print(f"{'Difficulty':<10} {'SR%':>7} {'SMR%':>7} {'TSA%':>7} "
-              f"{'ArgA%':>7} {'Order%':>7} {'SVR%':>7} {'N':>5}")
-        print("-" * 70)
-
-        for difficulty in DIFFICULTIES:
-            s = by_difficulty.get(difficulty)
-            if not s:
-                continue
-            print(
-                f"{difficulty:<10} "
-                f"{s['task_success_rate']:>6.2f}% "
-                f"{s['state_match_rate']:>6.2f}% "
-                f"{s['tool_selection_accuracy']:>6.2f}% "
-                f"{s['argument_accuracy']:>6.2f}% "
-                f"{s['order_exact_match_rate']:>6.2f}% "
-                f"{s['safety_violation_rate']:>6.2f}% "
-                f"{s['total_tasks']:>5}"
-            )
-
-    by_language = summarize_by_language(results)
-
-    if by_language:
-        gap = cross_language_gap(by_language)
-        print()
-        print(f"Cross-Language Gap (SR%): {gap['gap']:.2f} pts "
-              f"(max={gap['max_language']}, min={gap['min_language']})")
-        print(f"  Values: {gap['values']}")
-
-
-# ============================================================
-# CLI
-# ============================================================
 
 def build_parser() -> argparse.ArgumentParser:
-
     parser = argparse.ArgumentParser(
-        description=(
-            "Evaluate Qwen/LLM tool-call predictions "
-            "against the OpsMix-Ar Tiny Infra Service."
-        )
+        description="Evaluate Qwen/LLM tool-call predictions against the OpsMix-Ar Tiny Infra Service."
     )
-
-    parser.add_argument(
-        "--input",
-        required=True,
-        help=(
-            "JSON file containing model predictions."
-        ),
-    )
-
-    parser.add_argument(
-        "--language",
-        required=True,
-        choices=LANGUAGES,
-        help=(
-            "Language represented by the prediction file."
-        ),
-    )
-
-    parser.add_argument(
-        "--task",
-        help=(
-            "Evaluate one task."
-        ),
-    )
-
-    parser.add_argument(
-        "--tasks",
-        nargs="+",
-        help=(
-            "Evaluate selected task IDs."
-        ),
-    )
-
-    parser.add_argument(
-        "--all",
-        action="store_true",
-        help=(
-            "Evaluate every task in the input JSON."
-        ),
-    )
-
-    parser.add_argument(
-        "--base-url",
-        default=BASE_URL,
-        help=(
-            "Tiny Infra Service URL."
-        ),
-    )
-
-    parser.add_argument(
-        "--timeout",
-        type=float,
-        default=DEFAULT_TIMEOUT,
-        help=(
-            "HTTP timeout in seconds."
-        ),
-    )
-
-    parser.add_argument(
-        "--output-dir",
-        default=str(
-            RESULTS_DIR
-        ),
-        help=(
-            "Directory where evaluation results "
-            "will be saved."
-        ),
-    )
-
+    parser.add_argument("--input", required=True, help="JSON file containing model predictions.")
+    parser.add_argument("--language", required=True, choices=LANGUAGES)
+    parser.add_argument("--traces", help="Optional trace JSON keyed by task_id. Interactive 'events' traces enable retry/recovery scoring.")
+    parser.add_argument("--task", help="Evaluate one task.")
+    parser.add_argument("--tasks", nargs="+", help="Evaluate selected task IDs.")
+    parser.add_argument("--all", action="store_true", help="Evaluate every task in the input JSON.")
+    parser.add_argument("--base-url", default=BASE_URL)
+    parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT)
+    parser.add_argument("--output-dir", default=str(RESULTS_DIR))
     return parser
 
 
-# ============================================================
-# Main
-# ============================================================
-
-def main(
-    argv: list[str] | None = None,
-) -> int:
-
+def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
+    args = parser.parse_args(argv)
 
-    args = parser.parse_args(
-        argv
-    )
-
-    # --------------------------------------------------------
-    # Validate task selector
-    # --------------------------------------------------------
-
-    selectors = sum(
-        [
-            args.task is not None,
-            args.tasks is not None,
-            args.all,
-        ]
-    )
-
+    selectors = sum([args.task is not None, args.tasks is not None, args.all])
     if selectors > 1:
-        parser.error(
-            "Use only one of "
-            "--task, --tasks, or --all."
-        )
-
-    # --------------------------------------------------------
-    # Load predictions
-    # --------------------------------------------------------
+        parser.error("Use only one of --task, --tasks, or --all.")
 
     try:
-
-        predictions = load_predictions(
-            args.input
-        )
-
+        predictions = load_predictions(args.input)
+        traces = load_traces(args.traces)
     except Exception as exc:
-
-        print(
-            f"ERROR loading predictions: {exc}",
-            file=sys.stderr,
-        )
-
+        print(f"ERROR loading input: {exc}", file=sys.stderr)
         return 1
-
-    # --------------------------------------------------------
-    # Select tasks
-    # --------------------------------------------------------
 
     if args.task:
-
-        if args.task not in predictions:
-            print(
-                f"ERROR: Task '{args.task}' "
-                f"is not present in predictions.",
-                file=sys.stderr,
-            )
-
-            return 1
-
-        task_ids = [
-            args.task
-        ]
-
+        task_ids = [args.task]
     elif args.tasks:
-
-        missing = [
-            task_id
-            for task_id in args.tasks
-            if task_id not in predictions
-        ]
-
+        missing = [task_id for task_id in args.tasks if task_id not in predictions]
         if missing:
-
-            print(
-                "ERROR: These tasks are missing "
-                f"from predictions: {missing}",
-                file=sys.stderr,
-            )
-
+            print(f"ERROR: These tasks are missing from predictions: {missing}", file=sys.stderr)
             return 1
-
         task_ids = args.tasks
-
     else:
-
-        # Default behaviour = all tasks in prediction file.
-        task_ids = list(
-            predictions.keys()
-        )
+        task_ids = list(predictions.keys())
 
     if not task_ids:
-
-        print(
-            "ERROR: No tasks found.",
-            file=sys.stderr,
-        )
-
+        print("ERROR: No tasks found.", file=sys.stderr)
         return 1
-
-    # --------------------------------------------------------
-    # Evaluate
-    # --------------------------------------------------------
 
     results = evaluate_tasks(
         predictions=predictions,
@@ -1886,38 +867,15 @@ def main(
         base_url=args.base_url,
         timeout=args.timeout,
         selected_task_ids=task_ids,
+        traces=traces,
     )
 
-    # --------------------------------------------------------
-    # Save
-    # --------------------------------------------------------
-
-    detailed_path, summary_path = save_results(
-        results=results,
-        output_dir=args.output_dir,
-    )
-
-    # --------------------------------------------------------
-    # Print
-    # --------------------------------------------------------
-
-    print_summary(
-        results
-    )
-
-    print()
-    print(
-        f"Detailed results: {detailed_path}"
-    )
-
-    print(
-        f"Summary:          {summary_path}"
-    )
-
+    detailed_path, summary_path = save_results(results, args.output_dir)
+    print_summary(results)
+    print(f"Detailed results: {detailed_path}")
+    print(f"Summary:          {summary_path}")
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(
-        main()
-    )
+    raise SystemExit(main())
