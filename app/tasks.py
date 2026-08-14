@@ -47,6 +47,8 @@ def _parse_setup(setup: str | dict | None) -> dict:
             value = True
         elif value.lower() == "false":
             value = False
+        elif value.lower() in ("null", "none"):
+          value = None
         else:
             try:
                 if "." in value:
