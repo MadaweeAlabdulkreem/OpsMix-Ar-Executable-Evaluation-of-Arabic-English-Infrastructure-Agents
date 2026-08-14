@@ -103,12 +103,19 @@ def _task_start_state(task: dict) -> dict:
     return fresh
 
 
-def _conditional_violations(history: list, conditional_actions: list) -> list:
-    """Return violations for conditional actions.
+def _conditional_violations(
+    history: list,
+    conditional_actions: list,
+    gold_actions: list,
+) -> list:
+    """Return conditional-action violations.
 
-    A conditional rule applies only to matching calls.
-    If the rule declares args, both tool and args must match.
-    Otherwise, the rule matches by tool name only.
+    Rules:
+    - Match by tool.
+    - If conditional entry specifies args, also match exact args.
+    - If the same conditional target appears multiple times in the gold path,
+      apply the condition only to the LAST matching occurrence.
+    - Otherwise, apply it to the single matching occurrence.
     """
 
     violations = []
@@ -118,16 +125,63 @@ def _conditional_violations(history: list, conditional_actions: list) -> list:
         condition = entry["condition"]
         expected_args = entry.get("args")
 
+        # ----------------------------------------------------
+        # Find matching occurrences in the gold path
+        # ----------------------------------------------------
+
+        matching_gold_indexes = []
+
+        for index, gold in enumerate(gold_actions):
+            if gold["tool"] != tool:
+                continue
+
+            if expected_args is not None:
+                if gold.get("args", {}) != expected_args:
+                    continue
+
+            matching_gold_indexes.append(index)
+
+        # If the conditional target does not exist in gold,
+        # fall back to matching real history calls directly.
+        target_last_only = len(matching_gold_indexes) > 1
+
+        # ----------------------------------------------------
+        # Find matching calls in actual history
+        # ----------------------------------------------------
+
+        matching_history_calls = []
+
         for call in history:
             if call["tool"] != tool:
                 continue
 
-            # If conditional action specifies args,
-            # apply the condition only to that exact call shape.
             if expected_args is not None:
                 if call.get("args", {}) != expected_args:
                     continue
 
+            matching_history_calls.append(call)
+
+        if not matching_history_calls:
+            continue
+
+        # ----------------------------------------------------
+        # Repeated target:
+        # condition applies only to the LAST matching call
+        # ----------------------------------------------------
+
+        if target_last_only:
+            calls_to_check = [
+                matching_history_calls[-1]
+            ]
+
+        else:
+            calls_to_check = matching_history_calls
+
+        # ----------------------------------------------------
+        # Evaluate condition against state_before
+        # ----------------------------------------------------
+
+        for call in calls_to_check:
             state_before = call.get("state_before")
 
             if (
@@ -149,7 +203,6 @@ def _conditional_violations(history: list, conditional_actions: list) -> list:
 
     return violations
 
-
 def check(task_id: str) -> dict:
     """Grade the CURRENT sandbox state + call history against task `task_id`'s
        canonical rules: gold_actions, conditional_actions (optional),
@@ -164,8 +217,11 @@ def check(task_id: str) -> dict:
     gold_actions_correct = _gold_actions_satisfied(history, task["gold_actions"])
 
     #  2. conditional_actions (optional), evaluated per-call 
-    conditional_violations = _conditional_violations(history, task.get("conditional_actions", []))
-
+    conditional_violations = _conditional_violations(
+    history,
+    task.get("conditional_actions", []),
+    task["gold_actions"],
+)
     #  3. gold_final_state (partial, dotted-path, sentinel-aware) 
     start_state = _task_start_state(task)
     state_match = _gold_final_state_matches(state, task["gold_final_state"], start_state)
