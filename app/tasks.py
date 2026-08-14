@@ -118,6 +118,21 @@ def _build_initial_state(task: dict) -> dict:
             state["metrics"][service]["memory_mb"] = setup["memory_mb"]
 
     # ---------------------------------------------------------
+    # Process state
+    # ---------------------------------------------------------
+
+    if "pid" in setup and service:
+        pid = int(setup["pid"])
+
+        state.setdefault("processes", {})
+
+        state["processes"][pid] = {
+            "pid": pid,
+            "service": service,
+            "status": "running",
+        }
+
+    # ---------------------------------------------------------
     # Deployment state
     # ---------------------------------------------------------
 
