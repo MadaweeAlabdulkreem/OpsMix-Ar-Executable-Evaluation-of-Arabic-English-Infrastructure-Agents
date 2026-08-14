@@ -118,6 +118,19 @@ def _build_initial_state(task: dict) -> dict:
             state["metrics"][service]["memory_mb"] = setup["memory_mb"]
 
     # ---------------------------------------------------------
+    # Deployment state
+    # ---------------------------------------------------------
+
+    if "current_version" in setup or "previous_version" in setup:
+        state.setdefault("deployment", {})
+
+        if "current_version" in setup:
+            state["deployment"]["current_version"] = setup["current_version"]
+
+        if "previous_version" in setup:
+            state["deployment"]["previous_version"] = setup["previous_version"]
+
+    # ---------------------------------------------------------
     # Generic known state fields
     # ---------------------------------------------------------
 
