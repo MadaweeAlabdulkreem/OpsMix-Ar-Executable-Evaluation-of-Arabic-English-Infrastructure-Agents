@@ -104,23 +104,49 @@ def _task_start_state(task: dict) -> dict:
 
 
 def _conditional_violations(history: list, conditional_actions: list) -> list:
-    """Return a list of violations where a conditional action's tool was called
-       at a moment its condition did not hold, evaluated against that call's state_before."""
+    """Return violations for conditional actions.
+
+    A conditional rule applies only to matching calls.
+    If the rule declares args, both tool and args must match.
+    Otherwise, the rule matches by tool name only.
+    """
+
     violations = []
+
     for entry in conditional_actions:
         tool = entry["tool"]
         condition = entry["condition"]
+        expected_args = entry.get("args")
+
         for call in history:
             if call["tool"] != tool:
                 continue
+
+            # If conditional action specifies args,
+            # apply the condition only to that exact call shape.
+            if expected_args is not None:
+                if call.get("args", {}) != expected_args:
+                    continue
+
             state_before = call.get("state_before")
-            if state_before is None or not _condition_holds(state_before, condition):
+
+            if (
+                state_before is None
+                or not _condition_holds(
+                    state_before,
+                    condition
+                )
+            ):
                 violations.append({
                     "tool": tool,
                     "condition": condition,
                     "call_timestamp": call.get("timestamp"),
-                    "reason": "condition not satisfied in state_before for this call",
+                    "reason": (
+                        "condition not satisfied in state_before "
+                        "for this call"
+                    ),
                 })
+
     return violations
 
 
