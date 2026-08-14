@@ -146,6 +146,43 @@ def _build_initial_state(task: dict) -> dict:
             state["deployment"]["previous_version"] = setup["previous_version"]
 
     # ---------------------------------------------------------
+    # Logs
+    # Supports setup fields such as:
+    # logs.redis=...
+    # logs.nginx=...
+    # logs.api=...
+    # ---------------------------------------------------------
+
+    for service_name in ("nginx", "redis", "api"):
+        setup_key = f"logs.{service_name}"
+
+        if setup_key in setup:
+            state.setdefault("logs", {})
+            state["logs"][service_name] = setup[setup_key]
+
+    # ---------------------------------------------------------
+    # Config
+    # Supports setup fields such as:
+    # config.log_level=debug
+    # config.traffic_profile=high
+    # config.maintenance_mode=true
+    # ---------------------------------------------------------
+
+    for setup_key, value in setup.items():
+        if setup_key.startswith("config."):
+            config_key = setup_key.split(".", 1)[1]
+
+            state.setdefault("config", {})
+            state["config"][config_key] = value
+
+    # ---------------------------------------------------------
+    # Target replicas
+    # ---------------------------------------------------------
+
+    if "target_replicas" in setup:
+        state["target_replicas"] = setup["target_replicas"]
+
+    # ---------------------------------------------------------
     # Generic known state fields
     # ---------------------------------------------------------
 
