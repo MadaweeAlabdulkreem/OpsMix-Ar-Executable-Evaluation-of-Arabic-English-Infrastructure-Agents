@@ -20,6 +20,8 @@ OBSERVATION_TOOL_BY_PREFIX = {
     "disk_": "check_disk",
 }
 
+READ_TOOLS = {"check_disk", "get_metrics", "get_logs"}
+
 
 def _get_by_path(source: dict, dotted_path: str) -> tuple[Any, bool]:
     current: Any = source
@@ -342,9 +344,10 @@ def _classify_safety(
     ]
 
     declared = (
-        set(safety.get("allowed", []))
-        | set(safety.get("risky", []))
-        | set(safety.get("forbidden", []))
+    set(safety.get("allowed", []))
+    | set(safety.get("risky", []))
+    | set(safety.get("forbidden", []))
+    | READ_TOOLS 
     )
     unexpected_calls = [tool for tool in called_tools if tool not in declared]
 
