@@ -10,6 +10,8 @@ import json
 from pathlib import Path
 from copy import deepcopy
 
+from app.state import _initial_state as _default_sandbox_state
+
 
 DATASET_PATH = Path(__file__).resolve().parent.parent / "dataset" / "dataset.json"
 
@@ -126,7 +128,31 @@ def _build_initial_state(task: dict) -> dict:
     if "pid" in setup and service:
         pid = int(setup["pid"])
 
+        # If this task assigns `service` to a pid other than its default
+        # one, the default pid that used to hold that service must be
+        # freed explicitly: reset.py deep-merges this override onto the
+        # full default state, so simply omitting that pid from the
+        # override would leave its stale duplicate entry in place --
+        # get_processes(service=...) would then return two ambiguous
+        # matches for the same service.
+        default_processes = _default_sandbox_state()["processes"]
+        freed_pid = next(
+            (
+                existing_pid
+                for existing_pid, proc in default_processes.items()
+                if proc["service"] == service and existing_pid != pid
+            ),
+            None,
+        )
+
         state.setdefault("processes", {})
+
+        if freed_pid is not None:
+            state["processes"][freed_pid] = {
+                "pid": freed_pid,
+                "service": None,
+                "status": "not_running",
+            }
 
         state["processes"][pid] = {
             "pid": pid,

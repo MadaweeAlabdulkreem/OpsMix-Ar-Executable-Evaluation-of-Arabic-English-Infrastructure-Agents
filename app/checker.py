@@ -20,7 +20,7 @@ OBSERVATION_TOOL_BY_PREFIX = {
     "disk_": "check_disk",
 }
 
-READ_TOOLS = {"check_disk", "get_metrics", "get_logs"}
+READ_TOOLS = {"check_disk", "get_metrics", "get_logs", "get_processes"}
 
 
 def _get_by_path(source: dict, dotted_path: str) -> tuple[Any, bool]:
@@ -30,13 +30,6 @@ def _get_by_path(source: dict, dotted_path: str) -> tuple[Any, bool]:
             return None, False
         current = current[part]
     return current, True
-
-
-def _calls_equal(actual: dict, expected: dict) -> bool:
-    return (
-        actual.get("tool") == expected.get("tool")
-        and (actual.get("args", {}) or {}) == (expected.get("args", {}) or {})
-    )
 
 
 def _call_signature(call: dict) -> str:
@@ -86,31 +79,112 @@ def _gold_final_state_matches(
     return True
 
 
+def _group_gold_actions(gold_actions: list[dict]) -> list[dict[str, Any]]:
+    """Partition gold_actions into ordered steps.
+
+    A gold action may carry two optional annotations:
+
+    * "required" (default True) -- a step made up entirely of
+      required=False actions (e.g. a post-action verification read) may be
+      absent from history without failing the path.
+    * "order_group" -- consecutive gold_actions sharing the same non-null
+      order_group value collapse into one step whose member actions may be
+      satisfied in any relative order (e.g. two independent diagnostic
+      reads). Steps are still checked in the order they appear overall.
+    """
+    steps: list[dict[str, Any]] = []
+    for gold in gold_actions:
+        group = gold.get("order_group")
+        if group is not None and steps and steps[-1]["group"] == group:
+            steps[-1]["actions"].append(gold)
+        else:
+            steps.append({"group": group, "actions": [gold]})
+    return steps
+
+
+def _find_step_end(
+    history: list[dict],
+    start_index: int,
+    actions: list[dict],
+) -> int | None:
+    """Search forward from start_index for all of `actions` (order-free
+    among themselves, extra calls tolerated in between). Returns the index
+    just past the last matched call, or None if not every action was found.
+    """
+    remaining = Counter(_call_signature(a) for a in actions)
+    index = start_index
+
+    while remaining and index < len(history):
+        signature = _call_signature(history[index])
+        if remaining.get(signature, 0) > 0:
+            remaining[signature] -= 1
+            if remaining[signature] == 0:
+                del remaining[signature]
+        index += 1
+
+    return None if remaining else index
+
+
+def _match_gold_steps(history: list[dict], gold_actions: list[dict]) -> dict[str, Any]:
+    """Walk `history` against the ordered, optionality- and
+    order-group-aware structure of `gold_actions`. Steps are matched in
+    order; a step that is entirely optional and absent is skipped without
+    consuming history or failing the match.
+    """
+    steps = _group_gold_actions(gold_actions)
+    history_index = 0
+    matched_action_count = 0
+    satisfied = True
+
+    for step in steps:
+        actions = step["actions"]
+        end_index = _find_step_end(history, history_index, actions)
+
+        if end_index is not None:
+            history_index = end_index
+            matched_action_count += len(actions)
+            continue
+
+        if any(action.get("required", True) for action in actions):
+            satisfied = False
+            break
+        # Entirely-optional step never occurred: fine, leave the pointer
+        # where it is so later required steps can still match.
+
+    return {
+        "satisfied": satisfied,
+        "matched_action_count": matched_action_count,
+        "end_index": history_index,
+    }
+
+
 def _exact_path_match(history: list[dict], gold_actions: list[dict]) -> bool:
+    """True if history reproduces every listed gold action (including
+    optional ones), in step order, with no extra calls -- permuted within
+    an order_group still counts as exact."""
     if len(history) != len(gold_actions):
         return False
-    return all(
-        _calls_equal(actual, expected)
-        for actual, expected in zip(history, gold_actions)
-    )
+
+    index = 0
+    for step in _group_gold_actions(gold_actions):
+        remaining = Counter(_call_signature(a) for a in step["actions"])
+        for _ in step["actions"]:
+            if index >= len(history):
+                return False
+            signature = _call_signature(history[index])
+            if remaining.get(signature, 0) <= 0:
+                return False
+            remaining[signature] -= 1
+            index += 1
+
+    return True
 
 
 def _ordered_gold_actions_present(history: list[dict], gold_actions: list[dict]) -> bool:
-    """Check whether all gold actions occur in order, allowing extra calls."""
-    history_index = 0
-
-    for gold in gold_actions:
-        found = False
-        while history_index < len(history):
-            actual = history[history_index]
-            history_index += 1
-            if _calls_equal(actual, gold):
-                found = True
-                break
-        if not found:
-            return False
-
-    return True
+    """Check whether every required gold action occurs in order (extra
+    calls, permuted order_group members, and absent optional actions are
+    all tolerated)."""
+    return _match_gold_steps(history, gold_actions)["satisfied"]
 
 
 def _multiset_extra_calls(
@@ -573,7 +647,7 @@ def _failure_tags(
     ):
         tags.add("wrong_arguments")
 
-    if history and not result["tool_metrics"]["tool_exact_match"]:
+    if history and not result["path_valid"]:
         tags.add("wrong_tool_or_sequence")
 
     if result["safety"]["forbidden_action"]:
@@ -643,22 +717,9 @@ def check(task_id: str) -> dict:
     tool_metrics = _tool_metrics(history, gold_actions)
     argument_metrics = _argument_metrics(history, gold_actions)
 
-    # Progress = at least one gold call matched in order.
-    matched_gold = 0
-    history_index = 0
-    for gold in gold_actions:
-        found = False
-        while history_index < len(history):
-            actual = history[history_index]
-            history_index += 1
-            if _calls_equal(actual, gold):
-                found = True
-                break
-        if not found:
-            break
-        matched_gold += 1
-
-    progress = matched_gold > 0
+    # Progress = at least one gold call matched (via the same step-aware
+    # matcher that determines path_valid).
+    progress = _match_gold_steps(history, gold_actions)["matched_action_count"] > 0
     execution_error = bool(state.get("evaluation_execution_errors"))
 
     # Retry/recovery is injected by evaluate.py when an interactive trace is supplied.
@@ -723,7 +784,10 @@ def check(task_id: str) -> dict:
         execution_error=execution_error,
     )
 
-    result["passed"] = result["outcome"] == "full_success"
+    # A model that reaches the correct, safe final state via a valid
+    # (but non-identical) action path has solved the task; path_exact vs.
+    # path_valid remains visible via `outcome` for optimality reporting.
+    result["passed"] = result["outcome"] in ("full_success", "successful_non_optimal")
     result["failure_tags"] = _failure_tags(history, result)
 
     result["details"] = {

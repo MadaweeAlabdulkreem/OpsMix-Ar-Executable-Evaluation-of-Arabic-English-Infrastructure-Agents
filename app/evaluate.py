@@ -47,6 +47,7 @@ TOOL_ENDPOINTS: dict[str, tuple[str, str]] = {
     "get_metrics": ("GET", "/get_metrics"),
     "rollback_deploy": ("POST", "/rollback_deploy"),
     "get_logs": ("GET", "/get_logs"),
+    "get_processes": ("GET", "/get_processes"),
     "kill_process": ("POST", "/kill_process"),
     "set_config": ("POST", "/set_config"),
 }
@@ -73,6 +74,8 @@ def _build_query_params(tool: str, args: dict[str, Any]) -> dict[str, Any]:
     params = dict(args or {})
     if tool == "get_logs" and params.get("limit") is None:
         params.pop("limit", None)
+    if tool == "get_processes" and params.get("service") is None:
+        params.pop("service", None)
     return params
 
 
@@ -207,37 +210,33 @@ def _restore_checker_state(previous_state: dict[str, Any]) -> None:
     LOCAL_STATE.update(copy.deepcopy(previous_state))
 
 
-def _call_signature(call: dict[str, Any]) -> tuple[Any, str]:
-    return call.get("tool"), json.dumps(call.get("args", {}), sort_keys=True, ensure_ascii=False)
+def _build_grading_history(executed_calls: list[dict[str, Any]], remote_history: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Align each attempted call to its sandbox-recorded entry.
 
-
-def _build_grading_history(predicted_calls: list[dict[str, Any]], remote_history: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Align all attempted calls to sandbox-recorded calls.
+    Calls the sandbox accepted are appended to remote_history in the exact
+    order they were executed, so accepted calls are matched positionally
+    rather than by comparing argument dicts. Signature-based matching would
+    misfire whenever the sandbox records defaulted/normalized args that
+    don't literally equal what the caller sent (e.g. a get_logs/
+    get_processes call that omits an optional filter still gets recorded
+    with that key explicitly set to null), which would otherwise make a
+    genuinely accepted call look like a rejected one.
 
     Rejected/unknown calls are preserved as synthetic history entries, so
     safety/path evaluation cannot accidentally ignore an attempted forbidden
     or unknown tool merely because FastAPI rejected it before recording it.
     """
-    used: set[int] = set()
     grading_history = []
+    remote_index = 0
 
-    for predicted in predicted_calls:
-        signature = _call_signature(predicted)
-        match_index = None
-        for idx, recorded in enumerate(remote_history):
-            if idx in used:
-                continue
-            if _call_signature(recorded) == signature:
-                match_index = idx
-                break
-
-        if match_index is not None:
-            used.add(match_index)
-            grading_history.append(copy.deepcopy(remote_history[match_index]))
+    for call in executed_calls:
+        if call.get("recorded_by_sandbox") and remote_index < len(remote_history):
+            grading_history.append(copy.deepcopy(remote_history[remote_index]))
+            remote_index += 1
         else:
             grading_history.append({
-                "tool": predicted.get("tool"),
-                "args": copy.deepcopy(predicted.get("args", {})),
+                "tool": call.get("tool"),
+                "args": copy.deepcopy(call.get("args", {})),
                 "timestamp": None,
                 "state_before": None,
                 "synthetic_attempt": True,
@@ -546,7 +545,7 @@ def evaluate_task(
         result["total_execution_ms"] = round((time.perf_counter() - start_total) * 1000, 3)
         return result
 
-    grading_history = _build_grading_history(effective_calls, remote_history)
+    grading_history = _build_grading_history(result["executed_calls"], remote_history)
     result["history"] = _sanitize(grading_history)
     result["server_history"] = _sanitize(remote_history)
     result["final_state"] = _sanitize(remote_state)
@@ -585,6 +584,20 @@ def evaluate_task(
         "outcome": graded["outcome"],
         "failure_tags": graded["failure_tags"],
         "called_tools": graded["called_tools"],
+        # Replace the pre-execution estimates from _tool_and_argument_metrics /
+        # _order_and_set_metrics with the post-execution values graded against
+        # what the sandbox actually recorded (normalized args, rejected-call
+        # handling, order-tolerant path matching).
+        "tool_selection_correct": graded["tool_selection_correct"],
+        "tool_selection_total": graded["tool_selection_total"],
+        "tool_selection_accuracy": graded["tool_selection_accuracy"],
+        "argument_correct": graded["argument_correct"],
+        "argument_total": graded["argument_total"],
+        "argument_accuracy": graded["argument_accuracy"],
+        "order_exact_match": graded["order_exact_match"],
+        "order_score": graded["order_score"],
+        "precision": graded["precision"],
+        "recall": graded["recall"],
     })
 
     # Retry/recovery is meaningful only when an interactive trace contains
@@ -653,7 +666,7 @@ def summarize(results: list[dict[str, Any]]) -> dict[str, Any]:
         outcome = result.get("outcome", "unknown")
         outcomes[outcome] = outcomes.get(outcome, 0) + 1
 
-    passed = sum(result.get("outcome") == "full_success" for result in results)
+    passed = sum(bool(result.get("passed")) for result in results)
     state_correct = sum(bool(result.get("state_match")) for result in results)
     tool_correct = sum(result.get("tool_selection_correct", 0) for result in results)
     tool_total = sum(result.get("tool_selection_total", 0) for result in results)
